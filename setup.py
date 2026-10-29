@@ -231,6 +231,13 @@ def arm_cpu_arch():
     return ""
 
 
+def has_vram_bar(sizes):
+    """True when one of a PCI GPU's memory windows is big enough to be a VRAM aperture. A discrete card without
+    Resizable BAR still has a 256 MB window (e.g. an RTX 4090 with ReBAR off: 16 MB + 256 MB + 32 MB), while the
+    unified-memory parts (GB10, Jetson) expose only register windows of tens of MB."""
+    return any(x >= 128 << 20 for x in sizes)
+
+
 def unified_memory_pci_ids():
     """PCI ids (as sysfs names them) of GPUs whose memory is system RAM (Grace/GB10, Jetson): the device has no
     memory BAR of its own (only a tiny register window), unlike a discrete card's prefetchable BAR."""
@@ -249,7 +256,7 @@ def unified_memory_pci_ids():
                     parts = line.split()
                     if len(parts) >= 2:
                         sizes.append(int(parts[1], 16) - int(parts[0], 16) + 1)
-                if not any(x >= 1 << 30 for x in sizes):
+                if not has_vram_bar(sizes):
                     ids.add(d.name.lower())
             except OSError:
                 continue
