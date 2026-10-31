@@ -50,7 +50,11 @@ def main():
         txt = (ROOT / "maya-bench.txt").read_text(errors="replace") if (ROOT / "maya-bench.txt").exists() else ""
         if (ROOT / "maya-bench.txt").stat().st_mtime < t0 if txt else True:
             txt = ""                                   # stale file from an earlier run: this one wrote nothing
-        nums = {k: float(v) for k, v in re.findall(r"(decode|prefill[^:\n]*?)\D*?([\d.]+) tok", txt)}
+        nums = {}
+        m = re.search(r"decode \(writing the answer\): mean ([\d.]+)", txt)
+        if m: nums["decode"] = float(m.group(1))
+        for v, n in re.findall(r"prefill \(reading the prompt\): ([\d.]+) tokens/s, (\d+) tokens", txt):
+            nums[f"prefill{n}"] = float(v)
         row = {"ts": time.strftime("%F %T"), "label": label, "rep": rep, "rc": p.returncode, "secs": round(time.time() - t0),
                "env": env, "args": args, "parsed": nums, "bench": txt, "tail": (p.stdout + p.stderr)[-1500:]}
         with open(log, "a") as f:
