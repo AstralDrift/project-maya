@@ -7199,7 +7199,11 @@ struct Model::Impl {
         }
         auto made = std::make_unique<ExpertStore>();
         std::string err;
+        if (const char* v = ds4_env("DS4_STORE_CONTIG")) c.contig_path = v;   // (ds4_store.hpp: one read an expert)
         if (!made->init(c, geo, f, err)) return off(err);
+        if (const char* v = ds4_env("DS4_STORE_CONTIG_DUMP"))   // (tools/ds4/contig_pack.py's input)
+            std::fprintf(stderr, "ds4: RAM store: geometry for contig_pack.py %s %s.hdr/.json\n",
+                         made->dump_contig(v) ? "written to" : "NOT written to", v);
         store = std::move(made);
         store_split = store_env("DS4_STORE_SPLIT", 1.0) != 0;
         store_put = store_env("DS4_STORE_PUT", 1.0) != 0;

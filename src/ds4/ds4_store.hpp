@@ -83,7 +83,12 @@ public:
         bool unbuffered = false;
         std::function<uint64_t()> ram_avail;   // the RAM this process can still get (null or ~0: unknown)
         std::function<void(const ReadNote&)> before_read;   // (tests) called by a reader before each read
+        // DS4_STORE_CONTIG: a file holding each covered expert as one slot image (tools/ds4/contig_pack.py) - one
+        // unbuffered read an expert instead of three scattered ones (a DRAM-less NVMe reads 6.9 MB at once ~1.35x
+        // faster than three 2.3 MB pieces).  Used only when its header matches this store's geometry exactly.
+        std::string contig_path;
     };
+    static constexpr uint64_t kContigHdr = 65536;   // the contig file's header: contig_header(), zero-padded
     /// counters (any thread): asks served from a slot, asks read (or not: no_slot), the lookahead's guesses (asked for
     /// later, given up unasked, dropped unread), slots given up for another expert, reads failed, experts put, bytes
     /// read (of them unbuffered), the CPU lane's waits for reads, chunks given back
@@ -91,6 +96,7 @@ public:
         std::atomic<int64_t> hits{0}, misses{0}, no_slot{0}, guesses{0}, guess_used{0}, guess_wasted{0}, cancelled{0},
             evicted{0}, failed{0}, put{0}, bytes{0}, direct_bytes{0}, wait_ns{0}, shrunk{0};
         std::atomic<int64_t> direct_off{0};   // files whose unbuffered reads failed where buffered ones worked
+        std::atomic<int64_t> contig_reads{0}, contig_failed{0};   // whole-expert reads from the contig file
     };
     /// a window's experts of one layer from begin() to release(): st[i] kHit (in its slot, pinned - mat() reads it),
     /// kMiss (its read under way, the slot pinned), kNone (no slot to be had, or its read failed: read it in place)
@@ -120,6 +126,7 @@ public:
         }
         q_cv_.notify_all();
         for (std::thread& t : th_) t.join();   // (a read under way ends first: it writes into a chunk)
+        if (contig_fd_ != os::kBadFd) os::close_fd(contig_fd_);
         for (const auto& c : chunks_) os::anon_free(c.first, c.second);
     }
 
@@ -168,9 +175,56 @@ public:
             where_[l].assign((size_t) std::max(0, geo_[l].n_exp), -1);
             heat_[l].assign((size_t) std::max(0, geo_[l].n_exp), 0.0f);
         }
+        if (!cfg_.contig_path.empty()) open_contig();
         for (int i = 0; i < std::max(1, cfg_.readers); ++i) th_.emplace_back([this] { reader(); });
         return true;
     }
+
+    /// the contig file's header for this store: magic, slot bytes, the regions' starts, every layer's Geo
+    std::vector<uint8_t> contig_header() const {
+        std::vector<uint8_t> h;
+        auto put = [&h](uint64_t v) { for (int i = 0; i < 8; ++i) h.push_back((uint8_t) (v >> (8 * i))); };
+        const char magic[16] = "DS4CONTIG1";
+        h.insert(h.end(), magic, magic + 16);
+        put(slot_bytes_);
+        for (int r = 0; r < 3; ++r) put(tr_[r]);
+        put(geo_.size());
+        for (const Geo& g : geo_) {
+            put((uint64_t) (int64_t) g.n_exp);
+            for (int r = 0; r < 3; ++r) put((uint64_t) (int64_t) g.file[r]);
+            for (int r = 0; r < 3; ++r) put(g.off[r]);
+            for (int r = 0; r < 3; ++r) put(g.stride[r]);
+            for (int r = 0; r < 3; ++r) put(g.bytes[r]);
+        }
+        h.resize((size_t) kContigHdr, 0);
+        return h;
+    }
+    /// (DS4_STORE_CONTIG_DUMP) what contig_pack.py needs: prefix.hdr (the header) and prefix.json (files, geometry)
+    bool dump_contig(const std::string& prefix) const {
+        const std::vector<uint8_t> h = contig_header();
+        FILE* f = std::fopen((prefix + ".hdr").c_str(), "wb");
+        if (f == nullptr) return false;
+        const bool ok = std::fwrite(h.data(), 1, h.size(), f) == h.size();
+        std::fclose(f);
+        f = std::fopen((prefix + ".json").c_str(), "w");
+        if (f == nullptr || !ok) return false;
+        std::fprintf(f, "{\"slot_bytes\": %zu, \"align\": %llu, \"hdr\": %llu, \"tr\": [%zu, %zu, %zu],\n \"files\": [",
+                     slot_bytes_, (unsigned long long) kAlign, (unsigned long long) kContigHdr, tr_[0], tr_[1], tr_[2]);
+        for (size_t i = 0; i < files_.paths.size(); ++i) std::fprintf(f, "%s\"%s\"", i ? ", " : "", files_.paths[i].c_str());
+        std::fprintf(f, "],\n \"layers\": [");
+        for (size_t l = 0; l < geo_.size(); ++l) {
+            const Geo& g = geo_[l];
+            std::fprintf(f, "%s\n  {\"n_exp\": %d, \"file\": [%d, %d, %d], \"off\": [%llu, %llu, %llu], \"stride\": [%llu, %llu, %llu], "
+                         "\"bytes\": [%llu, %llu, %llu]}", l ? "," : "", g.n_exp, g.file[0], g.file[1], g.file[2],
+                         (unsigned long long) g.off[0], (unsigned long long) g.off[1], (unsigned long long) g.off[2],
+                         (unsigned long long) g.stride[0], (unsigned long long) g.stride[1], (unsigned long long) g.stride[2],
+                         (unsigned long long) g.bytes[0], (unsigned long long) g.bytes[1], (unsigned long long) g.bytes[2]);
+        }
+        std::fprintf(f, "]}\n");
+        std::fclose(f);
+        return true;
+    }
+    bool contig_on() const { return contig_fd_ != os::kBadFd; }
 
     size_t slot_bytes() const { return slot_bytes_; }
     size_t slots_max() const { return nmax_; }
@@ -333,7 +387,7 @@ public:
             n.erase(std::remove_if(n.begin(), n.end(),
                                    [&](const std::pair<int, int>& x) {
                                        const Slot& sp = slots_[(size_t) x.first];
-                                       return x.second < 3 || !sp.guess || sp.pin > 0;
+                                       return x.second < (contig_fd_ != os::kBadFd ? 1 : 3) || !sp.guess || sp.pin > 0;
                                    }),
                     n.end());
             if (n.empty()) return 0;
@@ -507,6 +561,37 @@ public:
 
 private:
     static constexpr uint8_t kFree = 0, kLoading = 1, kReady = 2;
+    static constexpr int kWhole = 3;   // a Job's r: the expert's whole slot image from the contig file
+    void open_contig() {
+        auto no = [this](const char* why) {
+            std::fprintf(stderr, "ds4: RAM store: contig file %s not used - %s; three reads an expert as before\n",
+                         cfg_.contig_path.c_str(), why);
+        };
+        contig_base_.assign(geo_.size(), 0);
+        uint64_t n = 0;
+        for (size_t l = 0; l < geo_.size(); ++l) {
+            contig_base_[l] = n;
+            n += (uint64_t) std::max(0, geo_[l].n_exp);
+        }
+        const os::fd_t fd = os::open_direct(cfg_.contig_path);
+        if (fd == os::kBadFd) return no("it does not open unbuffered");
+        uint8_t* buf = (uint8_t*) os::anon_alloc((size_t) kContigHdr, -1, 1);
+        const std::vector<uint8_t> want = contig_header();
+        const bool hdr = buf != nullptr && os::pread_direct(fd, buf, kContigHdr, 0) && std::memcmp(buf, want.data(), want.size()) == 0;
+        if (buf != nullptr) os::anon_free(buf, (size_t) kContigHdr);
+        const uint64_t need = kContigHdr + n * (uint64_t) slot_bytes_;
+        struct stat st{};
+        const bool big = ::fstat((int) fd, &st) == 0 && (uint64_t) st.st_size >= need;
+        if (!hdr || !big) {
+            os::close_fd(fd);
+            return no(!hdr ? "its header is not this model's layout" : "it is shorter than its experts");
+        }
+        contig_fd_ = fd;
+        std::fprintf(stderr, "ds4: RAM store: contig file %s - one %.1f MB read an expert (%llu experts)\n",
+                     cfg_.contig_path.c_str(), slot_bytes_ / 1e6, (unsigned long long) n);
+    }
+    os::fd_t contig_fd_ = os::kBadFd;
+    std::vector<uint64_t> contig_base_;   // [layer]: its first expert's block
     struct Slot {
         uint8_t* base = nullptr;            // (page-aligned; null: its chunk is not allocated)
         int layer = -1, e = -1, pin = 0;
@@ -601,14 +686,27 @@ private:
         sp.guess = guess;
         sp.state = kLoading;
         sp.bad.store(false, std::memory_order_relaxed);
-        sp.left.store(3, std::memory_order_release);
+        const bool whole = contig_fd_ != os::kBadFd;
+        sp.left.store(whole ? 1 : 3, std::memory_order_release);
         where_[(size_t) layer][(size_t) e] = s;
         if (front) link_front(s);
         else link_back(s);
         const Geo& g = geo_[(size_t) layer];
         {
             std::lock_guard<std::mutex> qk(q_mu_);
-            for (int r = 0; r < 3; ++r) {
+            if (whole) {   // (the slot's image, one read: its regions land where mat() looks)
+                Job j;
+                j.slot = s;
+                j.layer = layer;
+                j.e = e;
+                j.r = kWhole;
+                j.off = kContigHdr + (contig_base_[(size_t) layer] + (uint64_t) e) * slot_bytes_;
+                j.len = slot_bytes_;
+                j.dst = sp.base;
+                j.guess = guess;
+                (guess ? guess_q_ : demand_q_).push_back(j);
+            }
+            for (int r = 0; r < 3 && !whole; ++r) {
                 Job j;
                 j.slot = s;
                 j.layer = layer;
@@ -724,6 +822,25 @@ private:
     // straight to where they belong.  A file whose unbuffered read fails where the buffered one then works (a file
     // system or a USB bridge that opens with O_DIRECT but refuses its reads) is read buffered from then on
     bool read(const Job& j, std::vector<os::fd_t>& own, std::vector<char>& tried) {
+        if (j.r == kWhole) {
+            if (os::pread_direct(contig_fd_, j.dst, j.len, j.off)) {
+                counts_.contig_reads.fetch_add(1, std::memory_order_relaxed);
+                counts_.direct_bytes.fetch_add((int64_t) j.len, std::memory_order_relaxed);
+                return true;
+            }
+            counts_.contig_failed.fetch_add(1, std::memory_order_relaxed);   // (the three pieces from the model's files)
+            const Geo& g = geo_[(size_t) j.layer];
+            for (int r = 0; r < 3; ++r) {
+                Job k = j;
+                k.r = r;
+                k.file = g.file[r];
+                k.off = g.off[r] + (uint64_t) j.e * g.stride[r];
+                k.len = g.bytes[r];
+                k.dst = j.dst + tr_[r];
+                if (!read(k, own, tried)) return false;
+            }
+            return true;
+        }
         const size_t f = (size_t) j.file;
         bool direct_failed = false;
         if (f < files_.direct.size() && files_.direct[f] != os::kBadFd && !no_direct_[f].load(std::memory_order_relaxed)) {
