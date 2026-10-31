@@ -1072,12 +1072,20 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False):
+                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
+                 token_only_end: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
+        # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
+        # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
+        # through close_reasoning(), at the token.  A template that spells the end as text (GLM's, Qwen's) keeps the
+        # text search.
+        self.token_only_end = token_only_end
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
         self.buf = ""
+        self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
         self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1089,6 +1097,7 @@ class OutputParser:
         # the answer text that has gone out, followed to tell a call from a quoted one (Strata #1058): the open code
         # fence, the current line, and the backticks of the current paragraph
         self.fence, self.line, self.ticks = "", "", 0
+        self.malformed: list[str] = []   # the bodies of calls that did not parse (#613), for the server's log
         self._reset_scan()
 
     def _track(self, text: str) -> str:
@@ -1114,6 +1123,22 @@ class OutputParser:
     def _in_code(self) -> bool:
         """The answer so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+
+    def in_code_after(self, text: str) -> bool:
+        """Would `text` - the text held back from the stop-marker scan, which has not been fed yet - leave the next
+        character inside code?  The scan runs before feed(), so _in_code() alone is the state before this piece.  Tracks
+        it on a copy of the state and restores (the answer's own tracking sees the text only in feed)."""
+        snap = (self.fence, self.line, self.ticks)
+        try:
+            self._track(text)
+            return self._in_code()
+        finally:
+            self.fence, self.line, self.ticks = snap
+
+    @property
+    def call_opened(self) -> bool:
+        """A tool call is being read (its body): inside one, even quoted markers are the call's text."""
+        return self.state == "call"
 
     def _reset_scan(self):
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
@@ -1295,6 +1320,17 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def close_reasoning(self) -> list[Event]:
+        """The model's end-of-thinking token arrived: the reasoning ends there (token_only_end parsers; a text template
+        closes its own through the text).  Returns the events this close makes, if any."""
+        if self.state != "reasoning" or self.finished:
+            return []
+        out = [Event("reasoning", self.buf)] if self.buf else []
+        self.buf = ""
+        self.state, self.lead = "content", True
+        self.fence, self.line, self.ticks = "", "", 0
+        return out
+
     def feed(self, delta: str) -> list[Event]:
         if self.finished:
             return []
@@ -1311,6 +1347,11 @@ class OutputParser:
             if self.state != "content" and THINK_AGAIN in self.buf:
                 self.buf = self.buf.replace(THINK_AGAIN, "")    # (already reasoning; in a call: not an opening)
             if self.state == "reasoning":
+                if self.token_only_end:
+                    if self.buf:
+                        out.append(Event("reasoning", self.buf))
+                        self.buf = ""
+                    return out
                 i = self.buf.find(THINK_END)
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))
@@ -1370,8 +1411,14 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self._call_resume = 0
             else:
-                i = self.buf.find(CALL_END)
+                # the body accumulates in buf until the call closes, so searching from 0 every
+                # delta is O(body) per token.  In call state buf only grows, and a failed search over
+                # L chars rules out every start position up to L - len(CALL_END): resume there.
+                i = self.buf.find(CALL_END, self._call_resume)
+                if i < 0:
+                    self._call_resume = max(0, len(self.buf) - len(CALL_END) + 1)
                 complete = True
                 if self.stream_tools:
                     if i >= 0:
@@ -1391,7 +1438,24 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                except MalformedToolCall as e:
+                    # a call that does not parse never fails the whole answer (#613: 24K tokens lost to one): one
+                    # already announced goes out as written so far, marked incomplete (as one the output ended
+                    # inside); one that never got that far is the answer's text, as the model wrote it.  `malformed`
+                    # keeps the body for the server's log
+                    self.malformed.append(e.body)
+                    if self.scall is not None:
+                        rest, self.buf = self.buf, body          # (_close_scan reads the body's unscanned rest)
+                        out += self._close_scan()
+                        self.buf = rest
+                        out.append(Event("tool_call", call=self.scall, complete=False))
+                    else:
+                        out.append(Event("content", self._track(CALL_START + body + CALL_END)))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+                    continue
                 if self.dsml is not None and "::" in call.name:
                     call.namespace = call.name.split("::", 1)[0]
                 if self.scall is not None:

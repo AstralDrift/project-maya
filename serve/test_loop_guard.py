@@ -19,8 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import loop_guard as LG  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (IM_END, LOOP_STOP_NOTE, ByteTokenizer, Service, check_request_sampling, loop_guard_setting,  # noqa: E402
-                          serve)
+from serve.server import (IM_END, LOOP_STOP_NOTE, THINK_NOTE, THINK_RESTARTS, ByteTokenizer, Service, check_request_sampling,  # noqa: E402
+                          loop_guard_setting, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -528,7 +528,8 @@ class Server(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
         self.assertLess(done["completion_tokens"], 300)
         self.assertEqual(len(eng.calls), 2)
-        self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1})
+        self.assertEqual(svc.loop_guard_counts, {"detected": 2, "penalised": 1, "thinking_closed": 0, "stopped": 1,
+                                                 "tool_repeats": 0, "tool_blocked": 0, "collapsed": 0, "kept_going": 0})
 
     def test_a_third_loop_in_the_thinking_closes_it(self):
         tok = Tok()
@@ -544,7 +545,8 @@ class Server(unittest.TestCase):
         self.assertEqual(len(eng.calls), 4)                         # two penalties first, then the close
         self.assertEqual(eng.calls[3][0][-1], think_end)           # the thinking closed by its own token
         self.assertEqual(eng.calls[3][0].count(think_end), 1)
-        self.assertEqual(svc.loop_guard_counts, {"detected": 3, "penalised": 2, "thinking_closed": 1, "stopped": 0})
+        self.assertEqual(svc.loop_guard_counts, {"detected": 3, "penalised": 2, "thinking_closed": 1, "stopped": 0,
+                                                 "tool_repeats": 0, "tool_blocked": 0, "collapsed": 0, "kept_going": 0})
 
     def test_a_stop_before_any_answer_text_says_so(self):
         # a model with no end-of-thinking token that loops in its reasoning: the guard can only end it - never with
@@ -653,6 +655,339 @@ class Http(unittest.TestCase):
         self.assertGreater(off["choices"][0]["message"]["content"].count(BLOCK), 8)
 
 
+def agent(*rounds, user="find out why the module is offline"):
+    """A Chat Completions request: the user's message, then (command, result) rounds of one bash call each."""
+    msgs = [{"role": "user", "content": user}]
+    for i, (cmd, out) in enumerate(rounds):
+        msgs += [{"role": "assistant", "content": "", "tool_calls": [
+                     {"id": f"c{i}", "type": "function",
+                      "function": {"name": "bash", "arguments": json.dumps({"command": cmd})}}]},
+                 {"role": "tool", "tool_call_id": f"c{i}", "content": out}]
+    return {"messages": msgs, "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}]}
+
+
+NMCLI = ("nmcli -s connection show Smulnet | grep pmf", "802-11-wireless-security.pmf: 0 (default)")
+GREP = ("grep -n UL_RETRY src/uplink.cpp", "13:#define UL_RETRY_MIN 2000")
+
+
+class ToolRepeat(unittest.TestCase):
+    """Across turns: the same tool call with the same result again and again (GLM-5.3 over opencode ran two
+    commands in turn 25 times) gets a note after its result; the model reads it before it answers."""
+
+    def messages(self, req):
+        from serve.frontend import openai_to_messages
+        return openai_to_messages(req)[0]
+
+    def test_what_counts(self):
+        rep = LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP, NMCLI)))
+        self.assertEqual(rep, LG.ToolRepeat("bash", 3))
+        self.assertIn("`bash` has now run 3 times", LG.tool_note(rep))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, NMCLI, NMCLI)) +       # (the note itself)
+                                         [{"role": "user", "content": LG.tool_note(rep)}]))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, GREP, NMCLI, GREP))))       # twice: not yet
+        # the same command after an edit: another result each time - not a loop
+        edits = [r for n in (5, 4, 3, 2) for r in (("make test", f"{n} failed"), (f"sed -i {n}s/x/y/ a.c", ""))]
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(*edits[:-1]))))
+        # in a row with nothing in between, a result that differs only in numbers or garbled bytes is the same one
+        # (GLM-5.3's telnet test: "bytes received: 12 \ufffd\ufffd" then "15 \ufffd\ufffd\ufffd" ...) - not a wait
+        probe = [("python3 probe.py", f"bytes received: {n} REPLY: " + "\ufffd" * n) for n in (12, 15, 12, 15)]
+        self.assertEqual(LG.tool_repeat(self.messages(agent(*probe))), LG.ToolRepeat("bash", 4))
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(*[("sleep 30; tail -1 train.log", f"step {n}00/900")
+                                                               for n in range(1, 6)]))))
+        # the user's "continue" says nothing new: the count goes on
+        req = agent(NMCLI, NMCLI)
+        req["messages"] += [{"role": "user", "content": "Continue."}] + agent(NMCLI)["messages"][1:]
+        self.assertEqual(LG.tool_repeat(self.messages(req)), LG.ToolRepeat("bash", 3))
+        # the user spoke since: only the calls after their message count
+        req = agent(NMCLI, NMCLI, NMCLI)
+        req["messages"] += [{"role": "user", "content": "stop repeating and try a different approach"}]
+        req["messages"] += agent(NMCLI)["messages"][1:]
+        self.assertIsNone(LG.tool_repeat(self.messages(req)))
+        # the request does not end with a tool result: the model is answering the user
+        self.assertIsNone(LG.tool_repeat(self.messages(agent(NMCLI, NMCLI, NMCLI, user="x")) +
+                                         [{"role": "user", "content": "thanks"}]))
+
+    def test_the_prompt_gets_the_note_and_the_counts(self):
+        svc = Server().service(LoopingEngine(Tok(), HEAD, BLOCK))
+        seen = []
+        render = svc.render_ids
+        svc.render_ids = lambda messages, *a, **k: seen.append(messages) or render(messages, *a, **k)
+        req = agent(NMCLI, GREP, NMCLI, GREP, NMCLI)
+        msgs, tools, kw = __import__("serve.frontend", fromlist=["x"]).openai_to_messages(req)
+        svc.prepare(msgs, tools, dict(kw), 100)
+        self.assertEqual(seen[-1][-1], {"role": "user", "content": LG.tool_note(LG.ToolRepeat("bash", 3))})
+        self.assertEqual(seen[-1][:-1], LG.collapse(msgs).messages)     # (the repeated rounds: left out, below)
+        self.assertEqual(msgs[-1]["content"], NMCLI[1])                 # the request's own messages stay as sent
+        self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
+        self.assertIn("maya:loop_guard_tool_repeats_total 1", svc.prometheus())
+        svc.prepare(msgs, tools, dict(kw), 100, guard=False)          # the request's "loop_guard": false
+        self.assertEqual(seen[-1], msgs)
+        svc.prepare(self.messages(agent(NMCLI, GREP)), tools, dict(kw), 100)
+        self.assertEqual(seen[-1][-1], {"role": "tool", "content": GREP[1]})
+        self.assertEqual(svc.metrics()["loop_guard"]["tool_repeats"], 1)
+
+
+def call_text(cmd):
+    return f"<tool_call>\n<function=bash>\n<parameter=command>\n{cmd}\n</parameter>\n</function>\n</tool_call>"
+
+
+class ScriptEngine:
+    """Answer k of a request (its k-th engine call) is an empty thinking and scripts[k] (the last one again after
+    that), then the end.  Records every call's prompt."""
+
+    def __init__(self, tok, *scripts):
+        self.tok, self.max_context, self.made = tok, 1 << 20, 0
+        self.end = tok.encode(IM_END, parse_special=True)
+        self.think_end = tok.encode("</think>", parse_special=True)
+        self.scripts = [tok.encode("</think>\n\n" + s, parse_special=True) for s in scripts]   # (thinking: on)
+        self.prompts: list[list[int]] = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        from serve.server import CTX_SLACK
+        if len(ids) + max_new + CTX_SLACK > self.max_context:     # (as the engine rejects it)
+            raise ValueError(f"the prompt ({len(ids)} tokens) and max_new {max_new} are more than the context "
+                             f"{self.max_context}")
+        self.prompts.append(list(ids))
+        script = self.scripts[min(len(self.prompts), len(self.scripts)) - 1]
+        if any(i == self.think_end[0] for i in ids[-2:]):   # (the prompt already closed the thinking)
+            script = script[len(self.think_end):]
+        for t in (script + self.end)[:max_new]:
+            self.made += 1
+            yield t
+
+
+class ToolBlock(unittest.TestCase):
+    """After TOOL_NUDGES notes the model wrote the same call again (GLM-5.3: "the loop guard is right, act
+    differently" - and the same grep, ten more times): that call is blocked - it never reaches the client, the server
+    answers it in the prompt and the model goes on in the same answer."""
+
+    def answer(self, *scripts, rounds=(NMCLI,) * 5, engine=None, max_tokens=2000):
+        from serve.frontend import openai_to_messages
+        eng = engine or ScriptEngine(Tok(), *scripts)
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(agent(*rounds))
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, max_tokens)
+        events, done = [], None
+        for kind, x in svc.run(ids, thinking, tools, max_new, {"_blocked": kw.get("_blocked")}, threading.Event()):
+            if kind == "event":
+                events.append(x)
+            elif kind == "done":
+                done = x
+        calls = [e.call.arguments["command"] for e in events if e.kind == "tool_call"]
+        text = "".join(e.text for e in events if e.kind == "content")
+        return svc, eng, kw, calls, text, done
+
+    def test_notes_differ_and_when_it_blocks(self):
+        notes = [LG.tool_note(LG.ToolRepeat("bash", t)) for t in range(LG.TOOL_REPS, LG.TOOL_BLOCK + 1)]
+        self.assertEqual(len(notes), LG.TOOL_NUDGES)
+        self.assertEqual(len(set(notes)), LG.TOOL_NUDGES)               # worded differently each time
+        self.assertIn("blocked", notes[-1])                             # the last one says what comes next
+        msgs = ToolRepeat().messages
+        self.assertEqual(LG.tool_blocked(msgs(agent(NMCLI, GREP, NMCLI, GREP, NMCLI, GREP, NMCLI))), {})   # 4: notes
+        got = LG.tool_blocked(msgs(agent(NMCLI, GREP, NMCLI, GREP, NMCLI, GREP, NMCLI, GREP, NMCLI)))
+        self.assertEqual(list(got.values()), [LG.ToolRepeat("bash", 5)])   # NMCLI 5 times; GREP 4: not yet
+        self.assertEqual(list(got), [("bash", LG.args_key({"command": NMCLI[0]}))])
+        req = agent(*(NMCLI,) * 5)
+        req["messages"].append({"role": "user", "content": "try the band"})
+        self.assertEqual(LG.tool_blocked(msgs(req)), {})                 # the user spoke: free again
+
+    def test_blocked_then_moves_on(self):
+        other = "nmcli -f 802-11-wireless-security.key-mgmt connection show Smulnet"
+        svc, eng, kw, calls, text, done = self.answer(call_text(NMCLI[0]), "Checking the key management.\n" +
+                                                      call_text(other))
+        self.assertEqual(calls, [other])                                # the blocked one never went out
+        self.assertEqual(len(eng.prompts), 2)
+        first, second = eng.prompts
+        said = svc.tok.decode(second[len(first):])
+        self.assertTrue(said.startswith("</think>\n\n" + call_text(NMCLI[0])))   # what the model wrote, kept ...
+        self.assertIn(LG.block_result(LG.ToolRepeat("bash", 5)), said)  # ... the server's answer to it ...
+        self.assertIn(LG.block_note(LG.ToolRepeat("bash", 5)), said)    # ... and the note
+        self.assertTrue(second[:len(first)] == first)                   # (the conversation's cache goes on)
+        self.assertEqual((done["finish"], svc.metrics()["loop_guard"]["tool_blocked"]), ("stop", 1))
+        self.assertIn("maya:loop_guard_tool_blocked_total 1", svc.prometheus())
+
+    def test_again_and_again_it_is_steered_never_stopped(self):
+        other = "cat host/bellhost/bridge.py"
+        eng = ScriptEngine(Tok(), *[call_text(NMCLI[0])] * 3, call_text(other))
+        eng.temps = []
+        gen = eng.generate
+        eng.generate = lambda ids, n, smp, *a, **k: eng.temps.append((smp or {}).get("temperature")) or gen(ids, n, smp,
+                                                                                                         *a, **k)
+        svc, eng2, kw, calls, text, done = self.answer(engine=eng)
+        self.assertEqual(calls, [other])                                # it went on until it did something else
+        self.assertNotIn("stopped", text)
+        self.assertEqual(len(eng.prompts), 4)
+        rep, args = LG.ToolRepeat("bash", 5), LG.args_key({"command": NMCLI[0]})
+        for k in (1, 2, 3):                                             # each time its thinking starts elsewhere
+            said = svc.tok.decode(eng.prompts[k][len(eng.prompts[k - 1]):])
+            self.assertTrue(said.endswith(LG.block_steer(rep, args, k)), said[-200:])
+        self.assertEqual(len({LG.block_steer(rep, args, k) for k in (1, 2, 3)}), 3)
+        self.assertEqual(eng.temps[:2], [None, None])                  # the request's own, then hotter from the 2nd
+        self.assertGreater(eng.temps[3], eng.temps[2])
+        self.assertLessEqual(max(t for t in eng.temps if t), LG.BLOCK_HEAT_MAX)
+        self.assertEqual(svc.metrics()["loop_guard"]["tool_blocked"], 3)
+
+    def test_an_unlimited_answer_kept_going_fits_the_context(self):
+        # v1.1.41: no max_tokens (max_new = the context's room), kept going - the next engine call's prompt holds
+        # KEEP_NOTE and a steer too, and max_new - n ran past the context: "the prompt (188077 tokens) and max_new
+        # 860569 are more than the context 1048576", the answer an error
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, call_text(other), rounds=(NMCLI,) * 4, max_tokens=None)
+        self.assertEqual(calls, [other])
+        self.assertEqual(len(eng.prompts), 2)
+        self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], 1)
+        # and a blocked call's result in the prompt
+        other = "cat host/bellhost/bridge.py"
+        svc, eng, kw, calls, text, done = self.answer(call_text(NMCLI[0]), call_text(other), max_tokens=None)
+        self.assertEqual((calls, len(eng.prompts)), ([other], 2))
+
+    def test_a_continue_hears_what_is_blocked(self):
+        from serve.frontend import openai_to_messages
+        svc = Server().service(ScriptEngine(Tok(), "x"))
+        seen, render = [], svc.render_ids
+        svc.render_ids = lambda messages, *a, **k: seen.append(messages) or render(messages, *a, **k)
+        req = agent(*(NMCLI,) * 5)
+        req["messages"].append({"role": "user", "content": "continue"})
+        msgs, tools, kw = openai_to_messages(req)
+        svc.prepare(msgs, tools, kw, 100)
+        self.assertTrue(kw["_blocked"])                                 # still blocked after "continue" ...
+        self.assertEqual(seen[-1][-2:], [msgs[-1], {"role": "user", "content": LG.blocked_note(
+            LG.tool_blocked(msgs))}])                                   # ... and the model is told so first
+        self.assertIn(NMCLI[0], seen[-1][-1]["content"])
+
+    def test_it_does_not_end_its_turn_with_nothing(self):
+        # GLM-5.3 ended its turn with "OK - the loop guard is right. ... Break out: use what I have or answer the
+        # user." and the agent stopped: in a conversation that repeats itself, that answer goes on
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual(calls, [other])
+        said = svc.tok.decode(eng.prompts[1][len(eng.prompts[0]):])
+        self.assertIn(LG.KEEP_NOTE, said)
+        self.assertEqual(eng.prompts[1][-1], eng.think_end[0])   # (the answer went out: it goes on as the answer,
+        #                                                        its thinking closed - not re-opened after it)
+        self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], 1)
+        # an answer with something new in it may end the turn, however short it is: the model asked for the date
+        svc, eng, kw, calls, text, done = self.answer("30.10.2026", call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts), text), ([], 1, "30.10.2026"))
+        # a report of what it found may end the turn
+        report = "What I found:\n\n" + "\n".join(f"- Finding {i}: the operator claim at step {i} is read-only, so "
+                                                  "the bytes are dropped in on_bytes." for i in range(5))
+        svc, eng, kw, calls, text, done = self.answer(report, report.replace("Finding", "Result"),
+                                                      report.replace("Finding", "Fact"), rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts)), ([], 1))            # (it says something new: it ends)
+        # the same report once more, what it already said: not something new - it goes on
+        from serve.frontend import openai_to_messages
+        req = agent(*(NMCLI,) * 4)
+        req["messages"].insert(1, {"role": "assistant", "content": report})
+        req["messages"].insert(2, {"role": "user", "content": "continue"})
+        eng = ScriptEngine(Tok(), report, call_text(other))
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(req)
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        got = [x.call.arguments["command"] for k, x in svc.run(ids, thinking, tools, max_new,
+                                                              {"_blocked": kw.get("_blocked")}, threading.Event())
+               if k == "event" and x.kind == "tool_call"]
+        self.assertEqual(got, [other])
+        # and only so often: talk again and again ends the turn after KEEP_MAX pushes (never the token cap)
+        svc, eng, kw, calls, text, done = self.answer(talk, talk, talk, talk, call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual((len(eng.prompts), calls, done["finish"]), (1 + LG.KEEP_MAX, [], "stop"))
+        self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], LG.KEEP_MAX)
+        # a conversation that does not repeat itself: a short answer ends the turn as always
+        svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
+        self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
+
+    def test_what_is_not_blocked(self):
+        # four runs: notes only, the call goes out
+        self.assertEqual(self.answer(call_text(NMCLI[0]), rounds=(NMCLI,) * 4)[3], [NMCLI[0]])
+        # other arguments, and a blocked call next to another one in the same answer
+        self.assertEqual(self.answer(call_text("nmcli dev wifi"))[3], ["nmcli dev wifi"])
+        self.assertEqual(self.answer(call_text("ls") + "\n" + call_text(NMCLI[0]))[3], ["ls", NMCLI[0]])
+        # the request's "loop_guard": false: nothing blocked
+        from serve.frontend import openai_to_messages
+        svc = Server().service(ScriptEngine(Tok(), "x"))
+        msgs, tools, kw = openai_to_messages(agent(*(NMCLI,) * 5))
+        svc.prepare(msgs, tools, kw, 100, guard=False)
+        self.assertIsNone(kw["_blocked"])
+
+
+class Collapse(unittest.TestCase):
+    """A conversation that repeats itself: the prompt leaves out what the model already wrote (GLM-5.3 had "Hmm -
+    hold on: I realize something important." 543 times in an 88K prompt and went on writing it)."""
+
+    STUCK = ("Hmm \u2014 hold on: I realize something important. Hmm \u2014 hmm.\n\n"
+             "OK let me stop theorizing and go empirical: check the slot log.")
+
+    def turns(self, n, new=lambda i: ""):
+        """The user's question, then n rounds of the same thinking and the same grep (round i's own thinking new(i))."""
+        msgs = [{"role": "user", "content": "why do nc bytes never reach the device?"}]
+        for i in range(n):
+            msgs += [{"role": "assistant", "content": "", "reasoning_content": self.STUCK + new(i),
+                      "tool_calls": [{"id": f"c{i}", "type": "function", "function": {
+                          "name": "bash", "arguments": {"command": NMCLI[0]}}}]},
+                     {"role": "tool", "tool_call_id": f"c{i}", "content": NMCLI[1]}]
+        return msgs
+
+    def test_what_is_left_out(self):
+        self.assertIsNone(LG.collapse(self.turns(2)))                  # twice: no loop yet, the prompt as it is
+        msgs = self.turns(4, new=lambda i: f" Found: claim {i} is read-only." if i == 2 else "")
+        c = LG.collapse(msgs)
+        self.assertEqual(len(c.messages), 1 + 2)                       # the 1st round, whole; the rest repeats it -
+        self.assertEqual(c.messages[1]["reasoning_content"],          # its thinking with it, less the talk about
+                         "Hmm \u2014 hold on: I realize something important. Hmm \u2014 hmm.")   # the loop
+        self.assertEqual(c.rounds, 3)
+        msgs[5]["content"] = "The claim is read-only, so nc's bytes are dropped."   # text for the user stays
+        self.assertEqual(LG.collapse(msgs).messages[3], {"role": "assistant", "content": msgs[5]["content"]})
+        self.assertEqual(msgs[3]["reasoning_content"], self.STUCK)      # the request's own messages stay as sent
+
+    def test_a_check_run_again_in_a_row(self):
+        msgs = [{"role": "user", "content": "x"}]
+        for i, n in enumerate((12, 15, 12, 15)):
+            msgs += [{"role": "assistant", "content": "", "reasoning_content": f"Try {i}.", "tool_calls": [
+                         {"id": f"c{i}", "type": "function", "function": {"name": "bash",
+                                                                          "arguments": {"command": "probe"}}}]},
+                     {"role": "tool", "tool_call_id": f"c{i}", "content": f"bytes received: {n}"}]
+        c = LG.collapse(msgs)
+        self.assertEqual(len(c.messages), 3)                           # the first; the rest differ only in numbers
+
+    def test_the_next_request_starts_the_same(self):
+        msgs = self.turns(8, new=lambda i: f" Step {i}." if i % 3 == 0 else "")
+        whole = LG.collapse(msgs).messages
+        for cut in range(3, len(msgs) + 1, 2):                         # (every request ends with a tool result)
+            part = LG.collapse(msgs[:cut])
+            if part is not None:
+                self.assertEqual(part.messages, whole[:len(part.messages)])
+
+    def test_the_answer_text_by_paragraph_and_short_ones_stay(self):
+        code = "```\n}\n```"
+        msgs = [{"role": "user", "content": "x"}] + [{"role": "assistant", "content": f"Done.\n\n{code}\n\nThe fix "
+                                                      "is in uplink.cpp, line 13."} for _ in range(3)]
+        c = LG.collapse(msgs)
+        self.assertEqual([m["content"] for m in c.messages[2:]], [f"Done.\n\n{code}"] * 2)
+
+    def test_a_long_conversation_keeps_its_prompt_whole(self):
+        """#702: above COLLAPSE_MAX_CHARS the collapse is skipped, so the prompt's prefix stays the same and the
+        engine's conversation cache is still valid (a 126K-token prompt was read again, ~2 minutes)."""
+        msgs = self.turns(200)
+        self.assertGreater(LG.conv_chars(msgs), LG.COLLAPSE_MAX_CHARS)
+        self.assertIsNone(LG.collapse(msgs))
+        os.environ["MAYA_LOOP_GUARD_COLLAPSE_MAX"] = "1000000"          # (the behaviour before #702)
+        try:
+            self.assertIsNotNone(LG.collapse(msgs))
+            os.environ["MAYA_LOOP_GUARD_COLLAPSE_MAX"] = "lots"              # (not a number: the default, no error)
+            self.assertIsNone(LG.collapse(msgs))
+        finally:
+            os.environ.pop("MAYA_LOOP_GUARD_COLLAPSE_MAX", None)
+
+    def test_a_conversation_without_a_loop_is_untouched(self):
+        msgs = [{"role": "user", "content": "x"}]
+        for i in range(6):
+            msgs += [{"role": "assistant", "content": f"Step {i}: reading part {i}.", "reasoning_content": f"Part {i}."},
+                     {"role": "user", "content": f"ok {i}"}]
+        self.assertIsNone(LG.collapse(msgs))
+
+
 class GuardedUsage(unittest.TestCase):
     """After the guard, the engine goes on from prompt + the kept tokens: the request reports its own prompt's
     figures, not that call's (a guarded MiniMax answer said 5,919 cached tokens of a 246-token prompt)."""
@@ -663,6 +998,157 @@ class GuardedUsage(unittest.TestCase):
         self.assertEqual((got["prompt_tokens"], got["reused"], got["prompt_ms"]), (246, 127, 9.5))
         self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 300}, 1000)["reused"], 0)
         self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 5000}, 1000)["reused"], 1000)
+
+
+# DeepSeek-V4.1's turn markers, as its vocabulary has them (one CONTROL token each): built from code points, so this
+# file never spells them out (an agent's own stream through the server must not read as the marker)
+DS_USER = chr(0x3c) + chr(0xff5c) + "User" + chr(0xff5c) + chr(0x3e)
+DS_EOS = chr(0x3c) + chr(0xff5c) + "end" + chr(0x2581) + "of" + chr(0x2581) + "sentence" + chr(0xff5c) + chr(0x3e)
+
+
+class DeepTok(Tok):
+    """Tok, with DeepSeek's two full-width turn markers as one token each (the only ones its vocabulary has as one;
+    the ASCII ones are spelled out of ordinary pieces there)."""
+
+    SPECIALS = Tok.SPECIALS + [DS_USER, DS_EOS]
+    special_ids = {"eos": 256 + len(SPECIALS) - 1}     # (DS_EOS: the engine's --eos, default the tokenizer's)
+
+
+class SeqEngine:
+    """Answer k of a request (its k-th engine call) is seqs[k] (the last one again after that), then the turn's end.
+    Records every call's prompt."""
+
+    def __init__(self, tok, *seqs):
+        self.tok, self.max_context, self.prompts = tok, 1 << 20, []
+        self.seqs = seqs
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        seq = self.seqs[min(len(self.prompts), len(self.seqs)) - 1]
+        for t in (seq + self.tok.encode(IM_END, parse_special=True))[:max_new]:
+            yield t
+
+
+class ThinkingMarkers(unittest.TestCase):
+    """A model that quotes one of the server's end-of-turn markers inside its thinking ended the turn there (the
+    engine stops at its own EOS token, the server at its markers) - the agent died mid-thinking.  Inside the thinking
+    such a marker is the model's text: its token is skipped, and at the engine's EOS the server goes on with a note
+    (THINK_RESTARTS times).  In the answer it is text too when quoted in code or inside a tool call's body; spelled
+    out in ordinary pieces or in plain prose it ends the turn as always."""
+
+    def answer(self, *seqs, tok=None, stop=None):
+        from serve.frontend import openai_to_messages
+        tok = tok or DeepTok()
+        eng = SeqEngine(tok, *seqs)
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(agent())
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events, done = [], None
+        sampling = {"_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
+        if stop is not None:
+            sampling["stop"] = stop
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, threading.Event()):
+            if kind == "event":
+                events.append(x)
+            elif kind == "done":
+                done = x
+        text = "".join(e.text for e in events if e.kind == "content")
+        reason = "".join(e.text for e in events if e.kind == "reasoning")
+        calls = [e.call.name for e in events if e.kind == "tool_call"]
+        return svc, eng, text, reason, calls, done
+
+    def test_a_user_marker_in_the_thinking_is_text(self):
+        # its token is skipped, not fed: the thinking goes on and the answer follows
+        tok = DeepTok()
+        mark = tok.encode(DS_USER, parse_special=True)[0]
+        seq = tok.encode("thinking `", parse_special=True) + [mark] + \
+            tok.encode("` still thinking.\n</think>\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertIn("ANSWER OK", text)
+        self.assertNotIn(DS_USER, reason)                  # (the marker is the turn's token, not the thinking's text)
+
+    def test_the_engine_eos_in_the_thinking_resumes_it(self):
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        self.assertEqual(tok.special_ids["eos"], eos)
+        first = tok.encode("thinking about ", parse_special=True) + [eos]
+        second = tok.encode("</think>\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(first, second, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (2, "stop"))
+        self.assertIn("ANSWER OK", text)
+        said = svc.tok.decode(eng.prompts[1][len(eng.prompts[0]):])
+        self.assertIn(THINK_NOTE, said)                 # (the server's note: go on with the thinking)
+        self.assertIn(LG.keep_steer(1), said)
+
+    def test_the_resume_is_capped(self):
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("thinking ", parse_special=True) + [eos]
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"], text), (1 + THINK_RESTARTS, "stop", ""))
+
+    def test_a_marker_in_code_or_a_call_in_the_answer_is_text(self):
+        tok = DeepTok()
+        user = tok.encode(DS_USER, parse_special=True)[0]
+        code = tok.encode("</think>\n\nThe marker is `", parse_special=True) + [user] + \
+            tok.encode("` in the docs.\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(code, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertIn("ANSWER OK", text)
+        self.assertIn(DS_USER, text)                       # (kept as the answer's text)
+        fence = tok.encode("</think>\n\n```\n", parse_special=True) + [user] + \
+            tok.encode("\n```\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(fence, tok=tok)
+        self.assertIn("ANSWER OK", text)
+        call = tok.encode("</think>\n\n" + call_text("cat `" + DS_USER + "`") +
+                          "\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(call, tok=tok)
+        self.assertEqual((len(eng.prompts), calls, done["finish"]), (1, ["bash"], "stop"))
+        self.assertIn("ANSWER OK", text)
+
+    def test_a_marker_in_the_answer_prose_ends_the_turn(self):
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("</think>\n\nIt said ", parse_special=True) + [eos] + \
+            tok.encode(" here.\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("ANSWER OK", text)
+        # spelled out in ordinary pieces, in the answer's prose: the text scan ends it too
+        seq = tok.encode("</think>\n\nIt said ", parse_special=True) + tok.encode(DS_EOS, parse_special=False) + \
+            tok.encode(" here.\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertNotIn("ANSWER OK", text)
+        # ... but in inline code the pieces are text
+        seq = tok.encode("</think>\n\n`", parse_special=True) + tok.encode(DS_EOS, parse_special=False) + \
+            tok.encode("`\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertIn("ANSWER OK", text)
+
+    def test_a_gguf_named_tokenizer_resumes_at_every_turn_end_the_engine_stops_at(self):
+        # GLM's pack tokenizer names its ids by their GGUF keys (no "eos"), and the GLM engine ends at every turn-end
+        # token (<|endoftext|>, <|user|>, <|observation|>): a turn end in the thinking ended the engine there, and the
+        # server, waiting for an "eos" it never knew, closed the answer as "length" mid-thinking
+        class GgufTok(Tok):
+            special_ids = {"tokenizer.ggml.eos_token_id": 256 + 2}
+        tok = GgufTok()
+        first = tok.encode("thinking about ", parse_special=True)      # (SeqEngine ends it with <|im_end|>)
+        second = tok.encode("</think>\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(first, second, tok=tok)
+        self.assertEqual(svc.eos_ids, svc.stop_ids)
+        self.assertEqual((len(eng.prompts), done["finish"]), (2, "stop"))
+        self.assertIn("ANSWER OK", text)
+
+    def test_a_client_stop_string_stops_inside_code(self):
+        # the quoted-marker rule is for the server's own markers: a client's stop string stops wherever it is
+        tok = DeepTok()
+        seq = tok.encode("</think>\n\n```\nx = 1\nEND\ny = 2\n```\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok, stop=["END"])
+        self.assertEqual(done["finish"], "stop")
+        self.assertIn("x = 1", text)
+        self.assertNotIn("y = 2", text)
 
 
 if __name__ == "__main__":

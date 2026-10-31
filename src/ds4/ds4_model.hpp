@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::ds4 {
@@ -45,6 +46,7 @@ struct Options {
     // gives way, 0 lru, 1 lfu
     double ssd_cache_gb = 0.0;
     int ssd_policy = 0;
+    int experts = 0;                  // routed experts a token takes: the router's top n, renormalised (0: the model's)
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the
@@ -172,6 +174,16 @@ public:
     /// last token then rides along in the run of chunks instead of a window of its own); the same as
     /// feed(n - 1), checkpoint(slot), feed(1)
     bool feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err);
+    /// feed_mark() that also keeps the restore points `inner` on the way (positions inside the read - past its first
+    /// token, short of its last - in order, with mark()'s `shared`), each the state a read up to it leaves: the same as
+    /// feed() up to each and mark() there, then feed_mark() of the rest - but a run of chunks keeps them in one run
+    /// instead of a run up to each.  marks_inside(): whether n tokens read so, the points at rows `rel` of them, cost
+    /// at most a chunk's rows more than stopping at each (a long prompt's skip: the one read runs the rows before its
+    /// first point through every layer, where the reads after it would have skipped theirs) - else the caller stops the
+    /// read at the points, as before
+    bool feed_marks(const int* tokens, int n, int logits_rows, int slot,
+                    const std::vector<std::pair<int64_t, bool>>& inner, std::string& err);
+    bool marks_inside(int n, const std::vector<int64_t>& rel) const;
     /// The next token from the last feed's last logit row (greedy when temperature <= 0).
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
     /// The request's repetition / frequency / presence penalties (llama.cpp's) for every pick after this - sample() and
@@ -197,8 +209,13 @@ public:
     /// DeepSeek's reference does.  verify() keeps a draft d with probability min(1, p(d) / q(d)) over the request's
     /// chain - the speculative-sampling rule, so every token is still distributed as the model's own draw.
     int draft_block() const;
+    /// max_n / conf_min / cum_min: the caller's cut (at most max_n drafts - 0: any -, kept while each confidence is
+    /// at least conf_min and their running product at least cum_min); the drafts past the first one it cuts may be
+    /// left out (fewer returned), those before it are the same.  min_n: at least that many returned past a cut
+    /// (within max_n)
     bool draft(int y, std::vector<int>& drafts, std::vector<float>& conf, std::string& err, float temperature = 0.0f,
-               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
+               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0,
+               int max_n = 0, float conf_min = 0.0f, float cum_min = 0.0f, int min_n = 0);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
     /// A verify window's tokens at most (y and the drafts after it); verify() takes drafts from any source - those not
@@ -352,6 +369,7 @@ public:
     struct Tiers {
         int vram = 0, ram = 0, cpu = 0;
         double vram_gb = 0, ram_gb = 0, cpu_blob = 0;
+        double disk_gb = 0;   // the CPU lane's experts neither copied nor read ahead into RAM: on the SSD only
     };
     Tiers tiers() const;
 

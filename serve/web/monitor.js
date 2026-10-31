@@ -3,7 +3,7 @@
 import {html, useRef, useState} from "./preact.js";
 import {GIB, ago, ctxfmt, fmt, gb, isPhone, kfmt, rate, store} from "./lib.js";
 import {S, copyText, emit, toast} from "./state.js";
-import {fetchReport, reqAll} from "./server.js";
+import {fetchReport, reqAll, speculationView, tierShares} from "./server.js";
 import {newChat} from "./chats.js";
 import {setSide, status} from "./sidebar.js";
 import {Icon} from "./ui.js";
@@ -61,12 +61,10 @@ function Throughput({m}) {
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
   const a = sparkPath(h.tok_s), b = sparkPath(h.prefill_tok_s_mean);
-  // (DSpark: DeepSeek's server says whether it drafts, MiniMax's engine itself - dspark=0 / 1; the engine's STAT lines the
-  //  share of its drafts kept)
-  const spec = eng.dspark != null ? (+eng.dspark ? "DSpark" : "Off")
-    : eng.mtp == null ? (eng.dflash ? "DFlash2" : null) : +eng.mtp ? "MTP" : "Off";
-  const kept = +eng.dspark && tn && tn.drafts != null ? `${fmt(100 * tn.drafts)}% kept` : "";
-  // the fastest answer since Maya started (the server's, of answers 32 tokens or longer: a few tokens' speed says little)
+  // (the drafters on, and the share of their drafts the model kept: live from the engine's STAT lines, else the last answer's)
+  const spec = speculationView(m);
+  // the highest Decode figure since Maya started - live or a finished answer's (the server's, kept as each reading beats
+  // it; from 32 tokens on: a few tokens' speed says little)
   const peak = m.totals && m.totals.peak_decode;
   const when = peak ? new Date(peak.time * 1000) : null;
   const at = when ? when.toLocaleString([], new Date().toDateString() === when.toDateString()
@@ -78,8 +76,8 @@ function Throughput({m}) {
       <div class="speed" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
         <span class="speed__label"><i class="key key--dash"></i>Prefill · ${live.state === "reading" ? "reading now" : gen ? "this request" : last ? "last request" : "waiting"}</span>
         <span class="speed__mid num">${prefill == null ? "–" : fmt(prefill)}<small>tok/s</small></span></div>
-      <div class="speed" title=${peak ? `The fastest answer since Maya started: ${fmt(peak.tokens)} tokens at ${fmt(peak.tok_s, 1)} tok/s (${at}). Answers of 32 tokens or more count.`
-          : "The fastest answer since Maya started. Answers of 32 tokens or more count."}>
+      <div class="speed" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
+          : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>
         <span class="speed__label">Peak decode · ${peak ? at : "no answer yet"}</span>
         <span class="speed__mid num">${peak ? fmt(peak.tok_s, 1) : "–"}<small>tok/s</small></span></div>
     </div>
@@ -93,8 +91,12 @@ function Throughput({m}) {
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
       <div class="stat"><span class="stat__label">VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
       <div class="stat"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
-      <div class="stat" title=${kept ? "The share of the drafted tokens the model kept, in the last answer" : undefined}>
-        <span class="stat__label">Speculation</span><${Num} v=${spec} unit=${kept}/></div>
+      <div class="stat stat--spec" title=${spec.state === "off" ? "No drafter is running for this answer: every token comes from a full model step"
+          : "Drafting: a small drafter proposes tokens and the full model checks them. Shown: the drafts the model kept of those offered, live while an answer is written, else the last answer's. A dash: nothing drafted yet."}>
+        <span class="stat__label">Speculation</span>
+        <span class="stat__value stat__value--text">${spec.name == null ? "–" : spec.name}</span>
+        ${spec.state === "none" ? null : html`<span class="stat__note num">drafts kept: ${spec.state === "kept" ? spec.short : spec.text}</span>`}
+        ${spec.state === "kept" && spec.detail ? html`<span class="stat__note num">${spec.detail}</span>` : null}</div>
     </div>
   </section>`;
 }
@@ -151,9 +153,13 @@ function ContextCard({m}) {
                 {k: "fresh", label: r == null ? "Prompt" : "Read new", n: prompt - (r || 0)}, {k: "written", label: "Written", n: written}];
   const used = Math.min(max, prompt + written), free = Math.max(0, max - used), pct = (100 * used) / max;
   const win = +eng.kv_resident || 0, showWin = win > 0 && win < max;
+  // (the VRAM window is KV streaming's --kv-resident: Models > Engine settings > Prompts and cache, GLM and MiniMax alike)
+  const W = ctxfmt(win), where = showWin
+    ? "The window is a setting: Models › Engine settings › Prompts and cache › Positions each layer keeps in VRAM."
+    : "The size is a setting: Settings › Model › Context size.";
   const note = !running && !last ? "No conversation yet: the context fills as a chat goes on, with every message, file and tool result in it."
-    : showWin ? (used > win ? `Beyond the first ${ctxfmt(win)} positions the cache streams from RAM (KV streaming): about ${fmt((used * 12288) / 1e9, 1)} GB of RAM for this conversation.`
-                            : `Up to ${ctxfmt(win)} the whole cache stays in VRAM; beyond it, it streams from RAM (KV streaming).`)
+    : showWin ? (used > win ? `This chat is past the ${W} VRAM window: its cache is kept in RAM (about ${fmt((used * 12288) / 1e9, 1)} GB), ${W} tokens of it in GPU memory and the rest copied in when needed.`
+                            : `VRAM window: a chat up to ${W} tokens keeps its whole cache in GPU memory. A longer one keeps it in RAM, ${W} tokens of it in GPU memory and the rest copied in when needed.`)
     : "What the model holds at once: the chat, its files and tool results. A chat longer than this is refused: start a new one, or give the model a bigger context.";
   const aria = `${fmt(used)} of ${fmt(max)} tokens in use` + segs.map((s) => `, ${s.label.toLowerCase()} ${fmt(s.n)}`).join("");
   return html`<section class="card" aria-label="Context">
@@ -166,7 +172,7 @@ function ContextCard({m}) {
         <span style=${`flex-grow:${free}`}></span></div></div>
     <div class="legend">${segs.map((s) => html`<span><i class=${`sw sw--${s.k}`}></i>${s.label} <b class="num">${fmt(s.n)}</b></span>`)}
       <span><i class="sw sw--free"></i>Free <b class="num">${fmt(free)}</b></span></div>
-    <p class="card__note card__note--tip">${note} The size: Settings › Model, or the model's Engine settings on the Models page.</p>
+    <p class="card__note card__note--tip">${note} ${where}</p>
   </section>`;
 }
 
@@ -204,16 +210,18 @@ function Tiers({t, eng}) {
   const qwen = !!(eng && eng.engine_kind === "qwen");
   const set = TIER_SETS[ds4 ? "ds4" : mm3 ? "mm3" : qwen ? "qwen" : "glm"];
   const n = t.now, h = t.history || {};
+  const helper = ds4 && ((n.helper_held || 0) > 0 || (n.helper || 0) > 0 || +eng.helper_allocated_bytes > 0);
+  const helperHeld = n.helper_held != null ? n.helper_held : +eng.helper_slots || 0;
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
-  const vu = n.vram_used || 0, ru = n.ram_used || 0;
-  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng && eng.experts) || Math.max(1, vu + ru);
-  const disk = Math.max(0, total - vu - ru);
+  const {vu, ru, total, disk, vramGb, ramGb, diskGb} = tierShares(n, eng || {});
   let tip = "";
   if (ds4) {
     if (!stale && n.disk_mb != null && n.disk_mb >= 500) tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
-    else if (!stale && n.vram_hit != null && n.vram_hit < 0.5) tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
+    else if (!stale && n.vram_hit != null && n.vram_hit < 0.5)
+      tip = helper && !n.helper_dead ? "Most selections miss the primary cache; the helper handles some before CPU fallback."
+                   : "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
   } else if (!stale && n.disk != null && n.disk >= 3) {
     tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
   } else if (mm3 || qwen) {   // (MiniMax, CYBER-FROST: the CPU computes the experts VRAM does not hold)
@@ -223,15 +231,15 @@ function Tiers({t, eng}) {
   }
   const pc = (x) => (100 * x) / total;
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
-    <div class="card__head"><span class="card__title">Where the experts live</span>
+    <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
       <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : `live · ${fmt(total)} routed experts`}</span></div>
     <div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
       <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
     <div class="legend">
-      <span><i class="sw sw--vram"></i>VRAM <b class="num">${fmt(vu)} · ${fmt(n.vram_gb, 1)} GB</b></span>
-      <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(n.ram_gb, 1)} GB</b></span>
-      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}</b></span></div>
+      <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(vramGb, 1)} GB</b></span>
+      <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(ramGb, 1)} GB</b></span>
+      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
       ${set.map((x) => {
         const v = n[x.key];
@@ -250,6 +258,9 @@ function Tiers({t, eng}) {
           <${Spark} values=${(h[x.key] || []).map((y) => (y == null ? 0 : y))} tone=${x.tone || ""}/></div>`;
       })}
     </div>
+    ${helper ? html`<p class="card__note">${n.helper_dead ? "Helper unavailable; its selections fall back to the CPU."
+      : `Helper GPU: ${fmt(helperHeld)} profiled cached experts${n.helper == null ? "" : ` · ${fmt(n.helper, 2)} selections / evaluated token`}.`}
+      The bar shows primary VRAM and RAM backing. The helper pool is separate; CPU backing remains available for fallback.</p>` : null}
     ${tip ? html`<p class="card__note">${tip}</p>` : null}
   </section>`;
 }
@@ -261,7 +272,8 @@ function Tiers({t, eng}) {
 const GPU_PARTS = [
   {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
   {key: "prompt", label: "Prompt buffers"}, {key: "tp", label: "Tensor parallel"},
-  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
+  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "helper", label: "Helper experts"},
+  {key: "vision", label: "Vision encoder"},
   {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
 ];
 const GPU_PLAIN_FROM = 5;
@@ -312,6 +324,7 @@ function gpuDetail(g, segs, m) {
     tp: g.tp_n > 1 ? `the copies a group of ${g.tp_n} GPUs needs: the tensors each of them holds whole, and its layers' KV cache` : "",
     drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""].filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""].filter(Boolean).join(" · "),
+    helper: "separate helper expert pool; CPU backing available for fallback",
     vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process" : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
@@ -356,8 +369,10 @@ function GpuMap({m}) {
   const more = (g, b) => (g.slots && g.parts.pool ? Math.max(0, Math.floor(b / (g.parts.pool / g.slots))) : 0);
   const where = (gs) => (one ? "this GPU" : gpuList(gs));
   const pools = (gs) => (one ? "the expert pool" : gs.length > 1 ? "their expert pools" : "its expert pool");
-  const others = complete || plain ? [] : map.filter((g) => (g.parts.other || 0) >= 0.5 * GIB);
-  const frees = complete || plain ? [] : map.filter((g) => !g.vision_lent && (g.free || 0) >= 2 * GIB);
+  // A dedicated helper (or drafter-only device) has no primary pool to grow on restart.
+  const hasPrimaryPool = (g) => g.slots > 0 && (g.parts.pool || 0) > 0;
+  const others = complete || plain ? [] : map.filter((g) => hasPrimaryPool(g) && (g.parts.other || 0) >= 0.5 * GIB);
+  const frees = complete || plain ? [] : map.filter((g) => hasPrimaryPool(g) && !g.vision_lent && (g.free || 0) >= 2 * GIB);
   let advice = "";
   if (others.length) {
     const b = others.reduce((a, g) => a + g.parts.other, 0), n = others.reduce((a, g) => a + more(g, g.parts.other), 0);
@@ -466,8 +481,14 @@ function totalsLine(t, lg = {}) {
   // request rows say where), or that it is off
   const did = [[lg.penalised, "cut with a short penalty"], [lg.thinking_closed, "closed the thinking"],
                [lg.stopped, "ended the answer"]].filter(([n]) => n > 0).map(([n, s]) => `${fmt(n)} ${s}`);
-  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}`
-              : lg.on === false ? " · loop guard off" : "";
+  // (and across turns: a tool call made again and again with the same result, a note after it)
+  const tools = [lg.tool_repeats ? `${fmt(lg.tool_repeats)} repeated tool call${lg.tool_repeats === 1 ? "" : "s"} noted` : "",
+                 lg.tool_blocked ? `${fmt(lg.tool_blocked)} blocked` : "",
+                 lg.kept_going ? `${fmt(lg.kept_going)} kept going` : "",
+                 lg.collapsed ? `${fmt(lg.collapsed)} prompt${lg.collapsed === 1 ? "" : "s"} without the repeats` : ""]
+    .filter(Boolean).join(", ");
+  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}${tools ? `, ${tools}` : ""}`
+              : tools ? ` · loop guard: ${tools}` : lg.on === false ? " · loop guard off" : "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";

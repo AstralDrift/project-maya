@@ -248,6 +248,18 @@ class Config(unittest.TestCase):
         self.assertEqual(maya.config_family(c), "deepseek")
         self.assertIn("maya.py", (self.root / ("run-maya-ds4" + (".bat" if maya.WIN else ".sh"))).read_text())
 
+    def test_exl3_pictures_on_v100(self):
+        """The EXL3 quant's vision tower is the GGUF's (the same BF16 cuBLAS GEMMs): pictures on V100s too, and a setup
+        again after a config with --vision off turns them on; --no-vision keeps them off."""
+        pc = {"gpus": [{"index": i, "arch": "70"} for i in range(3)]}
+        old = {"args": ["--pack", "/old", "--max-context", "65536", "--vision", "off"]}
+        (self.root / "maya-ds4.json").write_text(json.dumps(old))
+        for no_vision in (False, True):
+            p = maya.write_config_ds4(args(no_vision=no_vision), pc, {"lib_dirs": []}, Path("/m/DS/maya-ds4"), 131072,
+                                      Path("/models"), Path("/m/DS"), "exl3")
+            a = json.loads(p.read_text())["args"]
+            self.assertEqual("--vision" in a, no_vision)
+
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"args": ["--pack", "/old/maya-ds4", "--max-context", "262144", "--tp", "1", "--prefill-chunk", "4096"],
                "gpu": [0, 1, 2], "reasoning_effort": "max", "sampling": {"temperature": 0.6}, "host": "0.0.0.0", "api_key": "k",
@@ -443,6 +455,234 @@ class Gguf(unittest.TestCase):
             self.assertTrue(u.startswith("https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/"))
             self.assertRegex(u, rev)
             self.assertIn("/%s/" % maya.DS4_QUANTS[q], u)
+
+    def test_ud_quants(self):
+        """unsloth's smaller UD quants (its re-upload of 2026-10-28): each pinned to that revision with every shard's size
+        and sha256; the VRAM + RAM that hold one are its files but the last shard (the Engram tables, read from the
+        SSD); chosen by hand, as UD-Q4_K_XL - not in the setup's list unless installed; shown under unsloth's names."""
+        want = {"gguf-iq1_s": (5, 233.0, 123), "gguf-iq1_m": (5, 250.4, 140), "gguf-iq2_xxs": (6, 300.5, 166),
+                "gguf-q2_k_xl": (7, 334.8, 200), "gguf-iq3_xxs": (7, 394.7, 234), "gguf-iq3_s": (8, 423.6, 263),
+                "gguf-q3_k_xl": (8, 485.1, 283)}
+        self.assertEqual(sorted(maya.DS4_UD), sorted(want))
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        for q, (n, gb, mem) in want.items():
+            m = maya.ds4_gguf_model(q)
+            self.assertEqual((m["format"], m["folder"], len(m["files"])), ("ds4-gguf", maya.DS4_QUANTS[q], n))
+            self.assertEqual(m["revision"], "8a6ec9cf118e785a362ea94ee123c61c70553be6")
+            self.assertTrue(all(re.match(r"^[0-9a-f]{64}$", s) for s in m["sha256"].values()))
+            self.assertAlmostEqual(m["download_gb"], gb, delta=0.1)
+            e = man["quants"][maya.DS4_QUANTS[q]]
+            self.assertEqual(e["bytes"], sum(v[0] for v in e["files"].values()))
+            self.assertRegex(e["table"], r"-%05d-of-%05d\.gguf$" % (n, n))   # (the tables: the last shard)
+            self.assertEqual(maya.ds4_memory_gb(q), mem)
+            self.assertIn("/resolve/8a6ec9cf118e785a362ea94ee123c61c70553be6/%s/" % maya.DS4_QUANTS[q],
+                          maya.file_url(m, sorted(m["files"])[0]))
+            self.assertEqual(maya.Q.shown("deepseek", q), "DeepSeek V4.1 · " + maya.DS4_QUANTS[q])
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(o[0] for o in opts)
+            return default
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None):
+            maya.choose_ds4_quant(args(), {})
+            self.assertFalse(any(x in r for r in rows for x in ("UD-IQ1_S", "UD-IQ2", "UD-IQ3_XXS", "UD-Q2", "UD-Q3")), rows)
+            self.assertEqual(sum("UD-IQ3_S" in r for r in rows), 1)   # (UD-IQ3_S and UD-IQ1_M: the listed ones)
+            self.assertEqual(sum("UD-IQ1_M" in r for r in rows), 1)
+            rows.clear()
+            self.assertEqual(maya.choose_ds4_quant(args(), {"installer": {"ds4_quant": "gguf-iq1_s"}}), "gguf-iq1_s")
+            self.assertTrue(any(r.startswith("DeepSeek V4.1 · UD-IQ1_S (233 GB)") for r in rows), rows)
+            rows.clear()
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-iq2_xxs"), {}), "gguf-iq2_xxs")
+            self.assertEqual(rows, [])
+
+    def test_iq1_m_listed(self):
+        """UD-IQ1_M is a listed choice before UD-IQ3_S, on its own facts (no comparison with Maya-XS)."""
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend((o[0], o[2]) for o in opts)
+            return default
+        pub = lambda k: k in ("maya-s", "maya-xs")  # noqa: E731
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None), patch.object(maya, "ds4_maya_published", pub):
+            maya.choose_ds4_quant(args(), {})
+        names = [r[0] for r in rows]
+        i = next(j for j, n in enumerate(names) if "UD-IQ1_M" in n)
+        self.assertIn("UD-IQ3_S", names[i + 1])
+        self.assertIn("(250 GB)", names[i])
+        for part in ("KLD 0.198", "90.3%", "140 GB", "110 GB", "150 GB"):
+            self.assertIn(part, rows[i][1])
+        self.assertNotIn("better", rows[i][1])
+
+
+    def test_iq3_s_listed(self):
+        """UD-IQ3_S is a listed choice, between Maya-S and the Q8, with its quality and the memory it wants; the other six
+        UD quants stay by hand."""
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend((o[0], o[2]) for o in opts)
+            return default
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None), patch.object(maya, "ds4_maya_published", lambda k: k == "maya-s"):
+            maya.choose_ds4_quant(args(), {})
+        names = [r[0] for r in rows]
+        i = next(j for j, n in enumerate(names) if "UD-IQ3_S" in n)
+        self.assertTrue(names[0].startswith("DeepSeek V4.1 · Maya-S"))
+        self.assertIn("UD-Q8_K_XL", names[i + 1])
+        self.assertIn("(424 GB)", names[i])
+        for part in ("KLD 0.061 vs Q8's 0.047", "Maya-S 0.119", "262 GB", "161 GB", "270 GB or more"):
+            self.assertIn(part, rows[i][1])
+        self.assertEqual(maya.ds4_memory_gb("gguf-iq3_s"), 263)
+
+    def test_free_space_per_disk(self):
+        """A shard that is a link to another disk is counted against that disk, not the model folder's."""
+        m = {"about": "x", "repo": "r", "folder": "f", "revision": "v", "download_gb": 30.0,
+             "files": {"a.gguf": int(10e9), "b.gguf": int(20e9)}, "sha256": {"a.gguf": "0", "b.gguf": "0"}}
+        root = Path(tempfile.mkdtemp())
+        d, other = root / "m", root / "other"
+        d.mkdir()
+        other.mkdir()
+        (d / "b.gguf").symlink_to(other / "b.gguf")
+        shards = [d / "a.gguf", d / "b.gguf"]
+        disks = {str(d): 1, str(other): 2}
+        free = {1: 15e9, 2: 100e9}
+
+        def usage(p):
+            return SimpleNamespace(free=free[disks[str(maya.existing(Path(p)))]])
+        with patch.object(maya, "disk_of", lambda p: disks[str(Path(p))]), \
+                patch.object(maya.shutil, "disk_usage", usage), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "hf_token", return_value="t"), patch.object(maya, "ask", return_value="n"), \
+                patch.object(maya, "rotational", return_value=False):
+            self.assertEqual(maya.linked_downloads(m, d, shards), {str(other): (100.0, 20.0)})
+            # 30 GB do not fit the folder's 15 GB free, but only 10 GB land there (20 GB go to the other disk's 100)
+            self.assertFalse(maya.offer_download(args(download_model=False), "x", d, shards, m))
+            free[2] = 21e9
+            with self.assertRaises(SystemExit):            # (20 + 3 GB wanted on the other disk, 21 free)
+                maya.offer_download(args(download_model=False), "x", d, shards, m)
+            free.update({1: 11e9, 2: 100e9})
+            with self.assertRaises(SystemExit):            # (10 + 3 GB wanted in the folder, 11 free)
+                maya.offer_download(args(download_model=False), "x", d, shards, m)
+
+    def _tables(self):
+        """Small stand-ins for the table files, and the manifest that names them."""
+        models = Path(tempfile.mkdtemp()) / "models"
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        pair = man["abliterated"]["engram"]["from"]["Maya-XS"]
+
+        def mk(path, data):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return [len(data), hashlib.sha256(data).hexdigest()]
+        return models, man, pair, man["quants"]["UD-IQ3_S"]["table"], mk
+
+    def test_shared_tables_unsloth_after_maya(self):
+        """UD-IQ3_S set up where Maya's Q6_K pair is whole (size and sha256): its table shard is left out and the pair is
+        read, linked (one copy); a damaged pair, or another UD quant, shares nothing."""
+        models, man, pair, table, mk = self._tables()
+        src = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        for n in pair:
+            man["maya"]["quants"]["Maya-XS"]["files"][n] = mk(src / Path(n).name, Path(n).name.encode() * 3)
+        d = models / "DeepSeek-V4.1-Flash-1017-GGUF" / "UD-IQ3_S"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        full = maya.ds4_gguf_model("gguf-iq3_s")
+        said = []
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: said.append(" ".join(map(str, a)))), \
+                patch.object(maya, "ok", lambda *a: None):
+            plan = maya.ds4_shared_tables("gguf-iq3_s", d, models, full)
+            self.assertEqual(sum("are the same bytes" in x for x in said), 1)         # (told once, before the sha256 reads)
+            self.assertEqual(plan["without"], [Path(table).name])
+            self.assertNotIn(Path(table).name, plan["model"]["files"])
+            self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 1)
+            self.assertAlmostEqual(plan["model"]["download_gb"], full["download_gb"] - 161.28, delta=0.05)
+            e = maya.ds4_share_step(plan)
+            self.assertEqual(e, d.parent / "Engram-Q6_K")
+            for n in pair:
+                self.assertEqual((e / Path(n).name).stat().st_ino, (src / Path(n).name).stat().st_ino)
+            self.assertIsNone(maya.ds4_shared_tables("gguf-iq3_xxs", d, models, maya.ds4_gguf_model("gguf-iq3_xxs")))
+            (src / Path(pair[0]).name).write_bytes(b"damaged")                    # (the pair no longer matches)
+            for x in e.iterdir():
+                x.unlink()
+            self.assertIsNone(maya.ds4_shared_tables("gguf-iq3_s", d, models, full))
+
+    def test_shared_tables_maya_after_unsloth(self):
+        """Maya-XS set up where UD-IQ3_S's table shard is whole (size and sha256): its pair of shards is left out and
+        unsloth's shard is read; its own pair there already, or unsloth's shard damaged: nothing to share."""
+        models, man, pair, table, mk = self._tables()
+        ud = models / "DeepSeek-V4.1-Flash-1017-GGUF" / "UD-IQ3_S" / Path(table).name
+        man["quants"]["UD-IQ3_S"]["files"][table] = mk(ud, b"unsloth table")
+        d = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        full = maya.ds4_gguf_model("maya-xs")
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+            plan = maya.ds4_shared_tables("maya-xs", d, models, full)
+            self.assertEqual(plan["without"], [Path(n).name for n in pair])
+            self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 2)
+            self.assertEqual(list(plan["src"]), [ud.name])
+            e = maya.ds4_share_step(plan)
+            self.assertEqual(e, d.parent / "Engram-UD-Q6_K")
+            self.assertEqual([x.name for x in e.glob("*.gguf")], [ud.name])
+            self.assertEqual((e / ud.name).stat().st_ino, ud.stat().st_ino)
+            ud.write_bytes(b"x")
+            self.assertIsNone(maya.ds4_shared_tables("maya-xs", d, models, full))     # (unsloth's shard damaged)
+            ud.write_bytes(b"unsloth table")
+            for n in pair:                                                              # (Maya's own pair is there)
+                man["maya"]["quants"]["Maya-XS"]["files"][n] = mk(d / Path(n).name, b"mine" + n.encode())
+            self.assertIsNone(maya.ds4_shared_tables("maya-xs", d, models, maya.ds4_gguf_model("maya-xs")))
+
+    def test_share_file_fallbacks(self):
+        """The one copy: a hard link, else a symbolic link, else a copy (with room for it); a file there already stays."""
+        root = Path(tempfile.mkdtemp())
+        src = root / "s" / "t.gguf"
+        src.parent.mkdir()
+        src.write_bytes(b"0123456789")
+        with patch.object(maya, "fail", side_effect=SystemExit):
+            self.assertEqual(maya.share_file(src, root / "a" / "t.gguf"), "hard link")
+            self.assertEqual(maya.share_file(src, root / "a" / "t.gguf"), "there")
+            with patch.object(maya.os, "link", side_effect=OSError):
+                self.assertEqual(maya.share_file(src, root / "b" / "t.gguf"), "symbolic link")
+                with patch.object(maya.os, "symlink", side_effect=OSError):
+                    self.assertEqual(maya.share_file(src, root / "c" / "t.gguf"), "copy")
+                    self.assertEqual((root / "c" / "t.gguf").read_bytes(), b"0123456789")
+                    with patch.object(maya.shutil, "disk_usage", return_value=SimpleNamespace(free=1e9)), \
+                            self.assertRaises(SystemExit):
+                        maya.share_file(src, root / "d" / "t.gguf")
+
+    def test_q8_q4_on_the_current_revision_unchanged(self):
+        """UD-Q8_K_XL and UD-Q4_K_XL are pinned to the same revision as the other UD quants (8a6ec9cf); every file's
+        name, size and sha256 is the one pinned before at c991b28e (checked against the Hub), and a folder that holds
+        them whole is valid under either revision - an install made earlier downloads nothing again."""
+        want = {"gguf-q8": "530007912f9637438fff4e34791c9a792ae2436b5a16913f5837e6e63e356573",
+                "gguf-q4": "f339e525a29bd127db40eddb2d215a7d7d1ce10fdc8793eb90c20d4821b8f299"}
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        for q, digest in want.items():
+            m = maya.ds4_gguf_model(q)
+            self.assertEqual(m["revision"], "8a6ec9cf118e785a362ea94ee123c61c70553be6")
+            files = man["quants"][maya.DS4_QUANTS[q]]["files"]
+            self.assertEqual(hashlib.sha256("\n".join("%s %d %s" % (k, v[0], v[1]) for k, v in sorted(files.items()))
+                                            .encode()).hexdigest(), digest)
+            tmp = Path(tempfile.mkdtemp())
+            d = tmp / maya.DS4_QUANTS[q]
+            d.mkdir()
+            small = json.loads(json.dumps(man))
+            for i, k in enumerate(sorted(small["quants"][maya.DS4_QUANTS[q]]["files"])):
+                small["quants"][maya.DS4_QUANTS[q]]["files"][k][0] = i + 1
+            for rev in ("c991b28e7c109eed10a55075ddb46f830b5b3059", "8a6ec9cf118e785a362ea94ee123c61c70553be6"):
+                small["revision"] = rev                       # (the folder was filled under the old revision)
+                p = tmp / "download_gguf.json"
+                p.write_text(json.dumps(small), encoding="utf-8")
+                with patch.object(maya, "DS4_GGUF_MANIFEST", p):
+                    mm = maya.ds4_gguf_model(q)
+                    self.assertEqual(mm["revision"], rev)
+                    for i, n in enumerate(sorted(mm["files"])):
+                        (d / n).write_bytes(b"x" * (i + 1))
+                    self.assertEqual([n for n in mm["files"] if maya.file_incomplete(mm, d / n)], [])
+                    self.assertIsNone(maya.ds4_earlier(mm, d))
 
     def test_earlier_layout_pinned(self):
         """unsloth's layout before its 2026-10-19 re-shard: 10 shards at dc788bdb, each with its size and sha256."""
@@ -735,7 +975,30 @@ class Vision(unittest.TestCase):
             f.write_bytes(b"s" * 8)
         return True
 
-    def fake_model(self):
+    def test_ud_quants_take_the_mmproj(self):
+        """unsloth's UD quants: its mmproj-BF16.gguf (pinned in "vision" / "mmproj"), packed by vision_pack.py --mmproj
+        into the same vision.bin, the download removed after; the other GGUFs keep DeepSeek's checkpoint shard."""
+        m = maya.ds4_vision_model(True)
+        self.assertEqual((m["repo"], m["revision"], list(m["files"])), ("unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+                         "8a6ec9cf118e785a362ea94ee123c61c70553be6", ["mmproj-BF16.gguf"]))
+        self.assertEqual(m["files"]["mmproj-BF16.gguf"], 972208288)
+        self.assertIn("model-00001-of-00048.safetensors", maya.ds4_vision_model()["files"])
+
+        def fake(mmproj=False):
+            return dict(self.fake_model(), files={"mmproj-BF16.gguf": 8}, mmproj=True,
+                        sha256={"mmproj-BF16.gguf": hashlib.sha256(b"s" * 8).hexdigest()})
+
+        def pack(cmd, check=True):
+            self.assertEqual(cmd[cmd.index("--mmproj") + 1], str(self.v / "mmproj-BF16.gguf"))
+            (self.v / "vision.bin").write_bytes(b"v")
+            (self.v / "vision.json").write_text("{}")
+            return SimpleNamespace(returncode=0)
+        with patch.object(maya, "ds4_vision_model", fake), \
+                patch.object(maya, "offer_download", self.fake_download), patch.object(maya, "run", pack):
+            self.assertTrue(maya.ds4_vision_step(args(), {}, self.d, mmproj=True))
+        self.assertFalse((self.v / "mmproj-BF16.gguf").exists())
+
+    def fake_model(self, mmproj=False):
         import hashlib
         return {"files": {"model-00001-of-00048.safetensors": 8, "config.json": 8},
                 "sha256": {n: hashlib.sha256(b"s" * 8).hexdigest() for n in ("model-00001-of-00048.safetensors",

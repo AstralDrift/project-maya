@@ -314,6 +314,12 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
                 st0.cpu_threads, st0.experts - st0.resident, m.max_ctx());
     if (st0.kv_ring > 0) std::printf(" kv_resident=%d", st0.kv_ring);   // (KV streaming: a layer's positions in VRAM)
     std::printf("\n");
+    // the same facts in the engine log (stderr) - the lines above reach the server only - for --report and a look at
+    // where the model went, as the run without --serve prints them
+    std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st0.load_s,
+                 st0.resident, st0.experts, st0.pinned_gb);
+    for (const std::string& l : m.info_lines()) std::fprintf(stderr, "maya-mm3: %s\n", l.c_str());
+    for (const std::string& l : m.vram_lines()) std::fprintf(stderr, "maya-mm3: %s\n", l.c_str());
     if (!m.vision()) std::printf("INFO vision=off\n");   // (no tower: the server answers text only)
     if (const mm3::VisionGeo* vg = m.vision())   // (serve/mm3_vision.py's Geometry.from_info)
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
@@ -470,20 +476,22 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         auto stat_line = [&]() {
             const auto& s = m.stats();
             const double per0 = produced > 0 ? 1.0 / (double) produced : 0.0;
-            char extra[96] = "";
+            char extra[160] = "";
             int ne = 0;
             if (s.staged > s_dec.staged)
                 ne += std::snprintf(extra + ne, sizeof extra - ne, " pcie=%.3f", (double) (s.staged - s_dec.staged) * per0);
-            if (d_off > 0) std::snprintf(extra + ne, sizeof extra - ne, " drafts=%.3f", (double) d_acc / (double) d_off);
+            if (d_off > 0) std::snprintf(extra + ne, sizeof extra - ne, " drafts=%.3f draft_acc=%lld draft_off=%lld",
+                                                           (double) d_acc / (double) d_off, d_acc, d_off);
             const double ms = now() * 1e3 - t1;
             const double ex = (double) ((s.profiled - s_dec.profiled)), cx = (double) (s.cpu_experts - s_dec.cpu_experts);
             const double per = produced > 0 ? 1.0 / (double) produced : 0.0;
             std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f vram_used=%ld ram_used=%ld vram_gb=%.2f "
-                        "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f%s\n",
+                        "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f disk_gb=%.2f%s\n",
                         ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
                         ex > 0 ? 1.0 - cx / ex : 1.0, cx * per, s.resident, s.pooled, s.vram_gb, s.pinned_gb,
                         s.pooled ? "ram_fetch" : "disk", cx * per, s.pooled ? "disk" : "ram_fetch",
-                        (double) (s.promoted - s_dec.promoted) * per, extra);
+                        (double) (s.promoted - s_dec.promoted) * per, std::max(0.0, s.all_gb - s.vram_gb - s.pinned_gb),
+                        extra);
         };
         // DSpark: a round drafts after the token, verifies the token and its drafts in one forward and keeps the drafts
         // the target agrees with - greedy: its argmax; sampling: a draft d (the draft's argmax) kept with the target's
@@ -717,10 +725,11 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         const double ms = now() * 1e3 - busy_t0, n = (double) std::max(1ULL, multi_n);
         const double xp = (double) (s.profiled - busy_s0.profiled), cx = (double) (s.cpu_experts - busy_s0.cpu_experts);
         std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f vram_used=%ld ram_used=%ld vram_gb=%.2f "
-                    "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f active=%zu\n",
+                    "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f disk_gb=%.2f active=%zu\n",
                     ms > 0 ? 1000.0 * (double) multi_n / ms : 0.0, ms / n, xp > 0 ? 1.0 - cx / xp : 1.0, cx / n,
                     s.resident, s.pooled, s.vram_gb, s.pinned_gb, s.pooled ? "ram_fetch" : "disk", cx / n,
-                    s.pooled ? "disk" : "ram_fetch", (double) (s.promoted - busy_s0.promoted) / n, run.size());
+                    s.pooled ? "disk" : "ram_fetch", (double) (s.promoted - busy_s0.promoted) / n,
+                    std::max(0.0, s.all_gb - s.vram_gb - s.pinned_gb), run.size());
     };
     auto release = [&](int s) {
         seqs[(size_t) s].busy = false;

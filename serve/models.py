@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import maya_names  # noqa: E402  (tools/) a setting under either of its names
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
@@ -33,7 +34,14 @@ CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's 
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
-QWEN_KV = ("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
+CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
+CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
+# the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
+# GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
+# end yet)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
+CONTEXT_TESTED_DEFAULT = 262144
+QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
 # files the setup's quant list (tools/maya_quants.py) does not name, by their config's installer key
 OTHER_QUANTS = {("deepseek", "abliterated"): "Mix-256G"}
@@ -117,6 +125,68 @@ def pack_of(cfg: dict) -> Path | None:
     return Path(p) if p else None
 
 
+# ------------------------------------------------------------------ the context a model was trained for
+def trained_context(model_dir) -> int | None:
+    """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
+    1,048,576): the top of the dashboard's Context size.  None when there is no readable GGUF."""
+    try:
+        from gguf_reader import GGUFFile                # (tools/, on the path above)
+        shards = sorted(Path(model_dir).glob("*-00001-of-*.gguf")) or sorted(Path(model_dir).glob("*.gguf"))
+        if not shards:
+            return None
+        md = GGUFFile(shards[0]).metadata
+        n = md.get(f"{md.get('general.architecture', '')}.context_length")
+        return int(n) if isinstance(n, int) and n > 0 else None
+    except Exception:  # noqa: BLE001 - a header it can't read: the fallback range
+        return None
+
+
+def trained_context_ds4(pack) -> int | None:
+    """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
+    max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
+    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
+    for name in ("ds4.txt", "mm3.txt"):
+        try:
+            with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    k, _, v = line.strip().partition(" ")
+                    if k == "max_position_embeddings":
+                        n = int(v.split()[0])
+                        return n if n > 0 else None
+        except (OSError, ValueError, IndexError):
+            continue
+    return None
+
+
+_trained: dict = {}
+
+
+def trained_context_of(cfg: dict) -> int | None:
+    """A config's model's trained context, as the server reads it when it runs that config (GLM: its GGUF header
+    beside --glm-pack; DeepSeek and MiniMax: --pack's own file); kept once found (a header read is not free)."""
+    args = [str(x) for x in cfg.get("args") or []]
+    if "--glm-pack" in args[:-1]:
+        key, read_it = ("gguf", str(Path(args[args.index("--glm-pack") + 1]).resolve().parent)), trained_context
+    elif "--pack" in args[:-1]:
+        key, read_it = ("pack", args[args.index("--pack") + 1]), trained_context_ds4
+    else:
+        return None
+    if key not in _trained:
+        n = read_it(key[1])
+        if n is None:
+            return None                                 # (not kept: the files may still be on their way)
+        _trained[key] = n
+    return _trained[key]
+
+
+def context_range(trained: int | None, current: int, engine_kind: str = "") -> dict:
+    """The dashboard's Context size slider for one model (Settings > Model for the running one, the Models page's
+    Engine settings for each): CONTEXT_MIN up to what the model was trained for (else CONTEXT_FALLBACK_MAX), never
+    below the size it has now; `tested`: past it the page says the size is untested on this engine."""
+    return {"min": CONTEXT_MIN, "max": max(trained or CONTEXT_FALLBACK_MAX, int(current or 0)), "trained": trained,
+            "tested": CONTEXT_TESTED.get(engine_kind, CONTEXT_TESTED_DEFAULT)}
+
+
 # ------------------------------------------------------------------ what a config can be switched to
 def dflash_file(cfg: dict) -> Path | None:
     """GLM's DFlash2 drafter: the one the config drafts with, else one a setup downloaded into its models folder."""
@@ -182,8 +252,9 @@ def choices(cfg: dict) -> dict:
     if family(cfg) == "deepseek":
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
-    if family(cfg) == "qwen":                          # (text only: no vision tower)
-        return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"], "images": False}
+    if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
+        return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
+                "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
             "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -207,8 +278,8 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
-        ram = env.get("MAYA_EXPERT_RAM_GB")
-        out.update(images=False, reserve_mib=_int(flag(args, "--vram-reserve-mib")),
+        ram = maya_names.lookup(env, "MAYA_EXPERT_RAM_GB")
+        out.update(images=bool(cfg.get("vision")), reserve_mib=_int(flag(args, "--vram-reserve-mib")),
                    draft="mtp" if flag(args, "--mtp") and flag(args, "--mtp-max-t") != "1" else "none",
                    expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
                    kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram))
@@ -242,7 +313,7 @@ def glm_streams(cfg: dict) -> bool:
     if kvs is not None:
         return kvs != "off"
     return (_int(flag(args, "--kv-resident"), 0) or 0) > 0 or \
-        (_int(env.get("MAYA_GLM_KV_RESIDENT") or env.get("STRATA_GLM_KV_RESIDENT"), 0) or 0) > 0
+        (_int(maya_names.lookup(env, "MAYA_GLM_KV_RESIDENT"), 0) or 0) > 0
 
 
 def _num(s: dict, key: str, lo: int, hi: int, what: str, none_ok: bool = True):
@@ -325,8 +396,15 @@ def apply(cfg: dict, settings: dict) -> dict:
         if qwen_mtp(cfg) is not None:   # (loaded either way - the server needs it; "none" keeps its drafts off)
             args = set_flag(args, "--mtp", qwen_mtp(cfg))
         args = drop_flag(args, "--mtp-max-t") if s["draft"] == "mtp" else set_flag(args, "--mtp-max-t", 1)
-        if s.get("images"):
-            raise ValueError("Images: this model has no vision tower (text only)")
+        # Images: the config's "vision" (maya-vision with the model's mmproj) and the engine's bare --vision flag (GENI
+        # requests); off keeps the entry as "vision_off", so Images can be switched on again
+        if s.get("images") and not out.get("vision"):
+            if not out.get("vision_off"):
+                raise ValueError("Images: this model was set up without its vision encoder (the setup adds it)")
+            out["vision"] = out.pop("vision_off")
+        elif not s.get("images") and out.get("vision"):
+            out["vision_off"] = out.pop("vision")
+        args = [x for x in args if x != "--vision"] + (["--vision"] if out.get("vision") else [])
         args = set_flag(args, "--vram-reserve-mib", reserve) if reserve is not None else \
             drop_flag(args, "--vram-reserve-mib")
         ec = _num(s, "expert_cache", 1, 1000000, "Expert cache")
@@ -340,8 +418,11 @@ def apply(cfg: dict, settings: dict) -> dict:
         ram = _num(s, "ram_gb", 0, 4096, "Experts in RAM (GB)")
         env2 = dict(out.get("env") or {})
         if ram is None:
-            env2.pop("MAYA_EXPERT_RAM_GB", None)
+            for name in maya_names.both_names("MAYA_EXPERT_RAM_GB"):   # (set under either name)
+                env2.pop(name, None)
         else:
+            for name in maya_names.both_names("MAYA_EXPERT_RAM_GB"):
+                env2.pop(name, None)
             env2["MAYA_EXPERT_RAM_GB"] = str(ram)
         if env2:
             out["env"] = env2
@@ -553,7 +634,10 @@ def describe(path: Path, running: str | None) -> dict:
             "size": folder_size(pack), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
-                                                                                                       CONTEXTS)}
+                                                                                                       CONTEXTS),
+            # (the Engine settings' Context size slider: the same range as Settings > Model's for this model)
+            "context_range": context_range(trained_context_of(cfg), cur.get("context"),
+                                           {"deepseek": "ds4", "minimax": "mm3"}.get(family(cfg), ""))}
 
 
 _gpu_cache: dict = {}

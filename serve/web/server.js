@@ -65,6 +65,53 @@ export async function poll() {
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) emit(); });
 
+// ------------------------------------------------------------------ Monitor figures that are computed (unit-tested)
+// The Speculation card: which drafters the engine runs with (the server's engine.speculation, empty: none) and how many of
+// the tokens they drafted the model kept - live while an answer is written (the engine's STAT draft_acc / draft_off, the
+// drafts since the request began), else the last answer's (its DONE line).  Three states, never a made-up 0%:
+//   off      no drafter is configured, or the running request asked for none (spec=1)  -> "off", "off"
+//   waiting  drafting is on, nothing drafted yet                                       -> the mode, "-"
+//   kept     drafting is on and drafts were offered                                    -> the mode, "62% (124 of 200)"
+export function speculationView(m, now = Date.now() / 1000) {
+  const eng = (m && m.engine) || {}, live = (m && m.live) || {}, tn = m && m.tiers && m.tiers.now, last = ((m && m.requests) || [])[0];
+  const modes = Array.isArray(eng.speculation) ? eng.speculation : null;
+  if (modes == null) return {state: "none", name: null, text: ""};                  // (a server that does not say)
+  const running = live.state === "generating";
+  const reqOff = running ? !!live.spec_off : !!(last && last.spec_off);
+  const off = modes.length === 0 || (running && !!live.spec_off);
+  if (off) return {state: "off", name: "off", text: "off", pct: null};
+  // the figures: this answer's while it is written (a reading from before it began is the last answer's: not this one's),
+  // else the last answer's
+  let acc = null, offered = null, pct = null;
+  const since = running && live.elapsed_s != null ? now - live.elapsed_s - 1 : null;
+  if (running) {
+    if (tn && tn.time && (since == null || tn.time >= since) && now - tn.time <= 30) {
+      if (tn.draft_off != null) { offered = +tn.draft_off; acc = +tn.draft_acc || 0; }
+      else if (tn.drafts != null) pct = 100 * tn.drafts;                              // (an engine that gives the share only)
+    }
+  } else if (last && !reqOff && last.drafts_offered != null) {
+    offered = +last.drafts_offered; acc = +last.drafts_accepted || 0;
+  }
+  const name = modes.join(" + ");
+  if (reqOff && !running) return {state: "off", name, text: "off", pct: null};      // (the last answer asked for no drafting)
+  if (offered != null && offered > 0) pct = 100 * acc / offered;
+  if (pct == null) return {state: "waiting", name, text: "\u2014", pct: null};
+  const text = offered != null && offered > 0 ? `${fmt(pct, 0)}% (${fmt(acc)} of ${fmt(offered)})` : `${fmt(pct, 0)}%`;
+  return {state: "kept", name, text, pct, accepted: acc, offered,
+          short: `${fmt(pct, 0)}%`, detail: offered != null && offered > 0 ? `${fmt(acc)} of ${fmt(offered)} drafted` : ""};
+}
+
+// "Where the experts live": the experts in VRAM, in RAM and on the SSD only, each with its bytes (the engine's
+// vram_gb / ram_gb / disk_gb; a count alone when an engine reports no bytes)
+export function tierShares(n, eng = {}) {
+  const ds4 = eng.engine_kind === "ds4";
+  const vu = n.vram_used || 0, ru = n.ram_used || 0;
+  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng.experts) || Math.max(1, vu + ru);
+  const disk = Math.max(0, total - vu - ru);
+  const gbOf = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
+  return {vu, ru, total, disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), diskGb: gbOf(n.disk_gb)};
+}
+
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request, "strata_mcp":
 // true, which only this page sends); Settings lists the servers and what they offer.
@@ -82,6 +129,7 @@ export async function loadMcp() {
 export const mcpOn = () => P.mcp !== false && S.mcp.tools > 0;
 
 // ------------------------------------------------------------------ the context size (a reload of the model)
+export const GLM_KV_BYTES = 12288;   // GLM's attention cache per token (KV streaming keeps all of it in RAM)
 export const CTX_STOPS = [4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 786432, 1048576];
 export async function loadCtxInfo() {
   try {
@@ -91,13 +139,14 @@ export async function loadCtxInfo() {
   emit();
   return S.ctxInfo;
 }
-export function ctxStops() {
-  const c = S.ctxInfo;
-  if (!c) return [];
-  let stops = CTX_STOPS.filter((v) => v >= c.min && v <= c.max);
-  if (!stops.includes(c.context)) stops = [...stops, c.context].sort((a, b) => a - b);
-  return stops;
+// the Context size slider's stops (Settings > Model and the Models page's Engine settings): CTX_STOPS within a model's
+// range ({min, max}: GET /api/context, or /api/models' context_range), and the sizes given (the one now, a draft's)
+export function ctxStopsIn(r, ...sizes) {
+  if (!r) return [];
+  const own = sizes.map(Number).filter((n) => n > 0);
+  return [...new Set([...CTX_STOPS.filter((v) => v >= r.min && v <= r.max), ...own])].sort((a, b) => a - b);
 }
+export const ctxStops = () => (S.ctxInfo ? ctxStopsIn(S.ctxInfo, S.ctxInfo.context) : []);
 // what a context size costs here: the engine's own measurement of the current size, scaled
 export function ctxEstimate(n) {
   const c = S.ctxInfo;
@@ -113,6 +162,26 @@ export function ctxEstimate(n) {
   const est = perTok * n, now = perTok * c.context;
   const expertGb = c.vram_gb && c.vram_slots ? +c.vram_gb / c.vram_slots : null;
   return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +c.vram_gb || null};
+}
+// the Context size slider's line under it (Settings > Model and the Models page alike): what n tokens of context cost.
+// `live`: the running engine's own measurement scaled (ctxEstimate); else from the cache's bytes per token - `ram`: a
+// streamed cache, every position in pinned RAM and `win` of them in VRAM (`whole`: a context up to `win` is not streamed,
+// GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
+export function ctxHint(n, {live = false, now = null, win = 0, whole = false, ram = 0, vram = 0} = {}) {
+  const e = live ? ctxEstimate(n) : null, same = now == null || n === now;
+  const more = (d) => (same || !d ? "." : ` · ${fmt(Math.abs(d), 1)} GB ${d > 0 ? "more" : "less"} than now.`);
+  const W = ctxfmt(win || (S.ctxInfo && S.ctxInfo.kv_resident) || 0);
+  if (e && e.ram) return `≈ ${fmt(e.gb, 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` + more(e.delta);
+  if (e) return `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (same ? "." : e.experts
+    ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
+  const gb = (bytes, k) => (bytes * k) / 2 ** 30;
+  if (ram && win) {
+    if (whole && n <= win) return `Up to ${W} the whole cache stays in VRAM.`;
+    return `≈ ${fmt(gb(ram, n), 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` +
+      (now != null && whole && now <= win ? "." : more(gb(ram, n - (now || 0))));
+  }
+  if (vram) return `≈ ${fmt(gb(vram, n), 1)} GB of GPU memory for the context, taken from the experts` + more(gb(vram, n - (now || 0)));
+  return "How much text the model holds at once: the chat, files and tool output. More context takes GPU memory from the experts, so answers get a little slower.";
 }
 // how long loading the model takes here: as long as its last load (GET /api/context's load_s), else the usual 1-3 minutes
 export function loadTime() {

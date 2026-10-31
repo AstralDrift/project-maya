@@ -8,6 +8,9 @@
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
+#include <cuda.h>   // (cuStreamWaitValue32's types: the function itself from the driver at run time, ar_wait_fn)
+#endif
+#if !defined(STRATA_USE_HIP)
 #include <mma.h>   // (sparse_attn_v7_kernel: Volta / Turing's FP16 tensor cores)
 #endif
 
@@ -2635,7 +2638,7 @@ __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const ui
     pdl_wait();
     pdl_trigger();
     const int r = blockIdx.x;
-    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
+    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL / Q5_K blocks at the row's start: eg_block_value)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = eg_block_value(rows + (size_t) r * hd, e, fmt);
         return;
@@ -3306,6 +3309,60 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
+#if defined(STRATA_USE_HIP)
+__global__ void __launch_bounds__(kThreads) ar_peer_kernel(float* x, int n4, PeerAr a, int mi, unsigned seq) {
+    __shared__ int ready;
+    if (threadIdx.x == 0) ready = (*reinterpret_cast<volatile unsigned*>(a.error) & 1u) == 0;
+    __syncthreads();
+    if (!ready) return; // a previous timed-out call poisons all subsequently queued calls
+    const int slot = int(seq & 1u);
+    float4* peer = reinterpret_cast<float4*>(a.peer_recv + size_t(slot) * a.stride);
+    const float4* received = reinterpret_cast<const float4*>(a.recv + size_t(slot) * a.stride);
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+        peer[q] = reinterpret_cast<const float4*>(x)[q];
+    // Every producer's stores must reach the peer before this block publishes completion.
+    __threadfence_system();
+    __syncthreads();
+    const size_t fi = (size_t(slot) * kPeerArBlocks + blockIdx.x) * kPeerArFlagStride;
+    if (threadIdx.x == 0) {
+        *reinterpret_cast<volatile unsigned*>(a.peer_flags + fi) = seq;
+        __threadfence_system();
+        // Core cycle counters may move backwards on this hardware; use the steady clock.
+        const uint64_t begin = uint64_t(wall_clock64());
+        ready = 1;
+        unsigned observed;
+        while (int((observed = *reinterpret_cast<const volatile unsigned*>(a.flags + fi)) - seq) < 0) {
+            const uint64_t elapsed = uint64_t(wall_clock64()) - begin;
+            if (elapsed >= a.timeout_ticks) {
+                if ((atomicOr(a.error, 1u) & 1u) == 0 && a.failure != nullptr) {
+                    a.failure->sequence = seq;
+                    a.failure->observed = observed;
+                    a.failure->block = blockIdx.x;
+                    a.failure->n4 = unsigned(n4);
+                    a.failure->rank = unsigned(mi);
+                    a.failure->elapsed_ticks = elapsed;
+                    a.failure->timeout_ticks = a.timeout_ticks;
+                    a.failure->captured = 1;
+                }
+                ready = 0;
+                break;
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (!ready) return;
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) {
+        const float4 local = reinterpret_cast<const float4*>(x)[q];
+        const float4 remote = ld_fresh(received + q);
+        const float4 left = mi == 0 ? local : remote;
+        const float4 right = mi == 0 ? remote : local;
+        reinterpret_cast<float4*>(x)[q] = make_float4(__fadd_rn(left.x, right.x), __fadd_rn(left.y, right.y),
+                                                    __fadd_rn(left.z, right.z), __fadd_rn(left.w, right.w));
+    }
+}
+#endif
+
 // two members (DS4_AR2, a chunk's all-reduces): the put and the sums pipelined.  Each block cuts its contiguous range
 // of the row in pieces of kAr2Piece float4s, puts piece k out, flags it (its progress word: seq << 12 | k + 1, after a
 // system fence) and then sums piece k - 1 - so a member's link carries its rows out while it reads the other's in,
@@ -3394,7 +3451,7 @@ __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
-    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
+    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL / Q5_K blocks at the row's start: eg_block_value)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = eg_block_value(rows, e, fmt);
         return;
@@ -4471,6 +4528,17 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     pdl_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
+#if defined(STRATA_USE_HIP)
+bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s) {
+    if (!x || (reinterpret_cast<uintptr_t>(x) & 15u) || n <= 0 || n % 4 || mi < 0 || mi > 1 || !a.recv || !a.peer_recv ||
+        (reinterpret_cast<uintptr_t>(a.recv) & 15u) || (reinterpret_cast<uintptr_t>(a.peer_recv) & 15u) || !a.flags ||
+        !a.peer_flags || !a.error || !a.timeout_ticks || a.stride < size_t(n) || a.stride % 4) return false;
+    const int blocks = std::max(1, std::min(kPeerArBlocks, cdiv(n / 4, kThreads)));
+    ar_peer_kernel<<<blocks, kThreads, 0, s>>>(x, n / 4, a, mi, seq);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+#endif
+
 void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
                    const ArAux* aux) {
     const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm;
@@ -4731,6 +4799,34 @@ void HostReducer::submit(unsigned seq, int n) {
     p_->cv.notify_one();
 }
 
+#if !defined(STRATA_USE_HIP)
+namespace {
+// cuStreamWaitValue32 from the driver (no link to libcuda): nullptr where the driver or the runtime has none
+using WaitValue32 = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+WaitValue32 ar_wait_fn() {
+    static const WaitValue32 f = []() -> WaitValue32 {
+        const char* e = std::getenv("DS4_AR_BACK_DMA");   // (opt-in, 1: a 5+ member group we have not run yet)
+        if (e == nullptr || std::atoi(e) == 0) return nullptr;
+#if CUDART_VERSION >= 12050
+        void* fp = nullptr;
+        cudaDriverEntryPointQueryResult q{};
+        if (cudaGetDriverEntryPointByVersion("cuStreamWaitValue32", &fp, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+            q != cudaDriverEntryPointSuccess)
+            fp = nullptr;
+        return (WaitValue32) fp;
+#else
+        return nullptr;
+#endif
+    }();
+    return f;
+}
+}  // namespace
+#endif
+
+// a chunk's sum read back (DS4_AR_BACK_DMA=1, where the driver has stream waits): the stream itself waits for each
+// piece's flag and the piece is DMA'd into this member's own FP16 rows (out by then: the host sums a piece only once
+// every member's is in), then converted - where the zero-copy kernel read it at half the link's speed beside the expert
+// ring's copies (76 MB: 20.5 ms against 11.5, an RTX 5060 Ti on PCIe 3.0 x8) and spun on the flag on the GPU
 void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
                     cudaStream_t s, const ArAux& aux) {
     const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = n / 4, NP = ar_host_pieces(), P4 = cdiv(n4, NP);
@@ -4746,6 +4842,30 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
         if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDeviceToHost, aux.s2);
         pdl_launch(set_flag_kernel, 1, 1, 0, aux.s2, a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
     }
+#if !defined(STRATA_USE_HIP)
+    if (const WaitValue32 wait = ar_wait_fn()) {
+        bool ok = true;
+        for (int p = 0; p < NP && ok; ++p) {
+            const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+            const unsigned* f = a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8;
+            ok = wait((CUstream) s, (CUdeviceptr) f, seq, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS;
+            if (ok && p1 > p0) {
+                cudaMemcpyAsync(own + p0, hsum + p0, (size_t) (p1 - p0) * 8, cudaMemcpyHostToDevice, s);
+                pdl_launch(ar_from16_kernel, std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s,
+                           (float4*) x + p0, (const uint2*) own + p0, p1 - p0, 0, 0);
+            }
+            if (!ok) {   // (the driver refused the wait: this piece on, as the kernels read them)
+                for (int q = p; q < NP; ++q) {
+                    const int q0 = std::min(n4, q * P4), q1 = std::min(n4, q0 + P4);
+                    pdl_launch(wait_flags_kernel, 1, 32, 0, s, a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + q) * 8, 1, 0, seq);
+                    if (q1 > q0)
+                        pdl_launch(ar_from16_zc_kernel, std::max(1, std::min(1024, cdiv(q1 - q0, kThreads))), kThreads, 0, s, (float4*) x, hsum, q1, q1, q1, q0);
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (int p = 0; p < NP; ++p) {
         const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
         pdl_launch(wait_flags_kernel, 1, 32, 0, s, a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8, 1, 0, seq);

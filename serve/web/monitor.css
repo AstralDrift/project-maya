@@ -59,6 +59,8 @@
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: 12px; padding-top: 14px; border-top: 1px solid var(--st-line); }
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat__label { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.stat__value--text { white-space: normal; overflow-wrap: anywhere; }
+.stat__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
 .stat__value { font-size: var(--st-fs-stat); font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat__value small { margin-left: 4px; font-size: var(--st-fs-sm); }
 
@@ -111,7 +113,7 @@
    blindnesses, on both themes); the expert pool keeps the experts' VRAM colour, the CUDA context a neutral grey, free the
    bare track */
 .gpumap { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-prompt: #1aa3be; --gm-tp: #5566d0; --gm-drafter: #d55181;
-          --gm-pool: var(--st-accent); --gm-vision: #008300; --gm-other: #d95926; --gm-used: var(--st-accent);
+          --gm-pool: var(--st-accent); --gm-helper: #a273d1; --gm-vision: #008300; --gm-other: #d95926; --gm-used: var(--st-accent);
           --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); }
 [data-theme="light"] .gpumap { --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-prompt: #0b8fa8; --gm-tp: #3c4bb4;
                                --gm-drafter: #e87ba4; --gm-other: #eb6834; }
@@ -140,6 +142,7 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
 .gpurows[data-focus="weights"] .gpubar__seg[data-k="weights"], .gpurows[data-focus="kv"] .gpubar__seg[data-k="kv"],
 .gpurows[data-focus="act"] .gpubar__seg[data-k="act"], .gpurows[data-focus="drafter"] .gpubar__seg[data-k="drafter"],
 .gpurows[data-focus="prompt"] .gpubar__seg[data-k="prompt"], .gpurows[data-focus="tp"] .gpubar__seg[data-k="tp"],
+.gpurows[data-focus="helper"] .gpubar__seg[data-k="helper"],
 .gpurows[data-focus="pool"] .gpubar__seg[data-k="pool"], .gpurows[data-focus="vision"] .gpubar__seg[data-k="vision"],
 .gpurows[data-focus="rest"] .gpubar__seg[data-k="rest"], .gpurows[data-focus="other"] .gpubar__seg[data-k="other"],
 .gpurows[data-focus="used"] .gpubar__seg[data-k="used"] { opacity: 1; }
@@ -179,6 +182,10 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .card { padding: 16px; }
   .speed__big { font-size: 40px; }
   .speeds { row-gap: 14px; }
+  /* the three one-line figures side by side, the taller Speculation on its own row: no blank under a short one */
+  .stats { grid-template-columns: repeat(3, auto); justify-content: space-between; column-gap: 8px; }
+  .stats .stat__label { white-space: nowrap; }
+  .stat--spec { grid-column: 1 / -1; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }
